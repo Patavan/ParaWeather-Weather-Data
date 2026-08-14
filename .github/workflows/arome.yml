@@ -20,15 +20,19 @@ jobs:
         env:
           METEOFRANCE_BASIC_AUTH: ${{ secrets.METEOFRANCE_BASIC_AUTH }}
         run: |
-          RESPONSE=$(curl -fsS \
+          RESPONSE=$(curl -fsS -k \
             -X POST \
             "https://portail-api.meteofrance.fr/token" \
             -d "grant_type=client_credentials" \
             -H "Authorization: Basic ${METEOFRANCE_BASIC_AUTH}")
 
-          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+          if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // .token // empty')
+          else
+            ACCESS_TOKEN=$(echo "$RESPONSE" | tr -d '\r\n"')
+          fi
 
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+          if [ -z "$ACCESS_TOKEN" ]; then
             echo "Kein Access Token erhalten."
             exit 1
           fi
@@ -47,11 +51,20 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
         run: |
-          curl -fsSL \
+          HTTP_CODE=$(curl -sS -L \
+            -o arome-capabilities.xml \
+            -w "%{http_code}" \
             "https://public-api.meteofrance.fr/public/arome/1.0/wcs/MF-NWP-HIGHRES-AROME-001-FRANCE-WCS/GetCapabilities?service=WCS&version=2.0.1&language=eng" \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "accept: */*" \
-            -o arome-capabilities.xml
+            -H "accept: */*")
+
+          echo "HTTP Status: ${HTTP_CODE}"
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "AROME GetCapabilities fehlgeschlagen."
+            cat arome-capabilities.xml || true
+            exit 1
+          fi
 
           test -s arome-capabilities.xml
 
@@ -73,18 +86,12 @@ jobs:
           for element in root.iter():
               tag = element.tag.split("}")[-1]
 
-              if tag in (
-                  "CoverageId",
-                  "Identifier"
-              ):
-                  value = (
-                      element.text.strip()
-                      if element.text
-                      else ""
-                  )
+              if tag in ("CoverageId", "Identifier"):
+                  if element.text:
+                      value = element.text.strip()
 
-                  if value and value not in coverages:
-                      coverages.append(value)
+                      if value and value not in coverages:
+                          coverages.append(value)
 
           keywords = {
               "temperature": [
@@ -92,38 +99,32 @@ jobs:
                   "T2M",
                   "2M"
               ],
-
               "wind_u": [
                   "UGRD",
                   "U_COMPONENT",
                   "U10"
               ],
-
               "wind_v": [
                   "VGRD",
                   "V_COMPONENT",
                   "V10"
               ],
-
               "gust": [
                   "GUST",
                   "RAF",
                   "VMAX"
               ],
-
               "precipitation": [
                   "PRECIP",
                   "RAIN",
                   "RR",
                   "TP"
               ],
-
               "cloud": [
                   "CLOUD",
                   "NEB",
                   "CLCT"
               ],
-
               "pressure": [
                   "PRESSURE",
                   "PMSL",
@@ -139,77 +140,43 @@ jobs:
               for coverage in coverages:
                   upper = coverage.upper()
 
-                  if any(
-                      word in upper
-                      for word in words
-                  ):
-                      matches[category].append(
-                          coverage
-                      )
+                  if any(word in upper for word in words):
+                      matches[category].append(coverage)
 
           result = {
-              "status":
-                  "ok",
-
-              "source":
-                  "Météo-France",
-
-              "model":
-                  "AROME",
-
-              "resolution_deg":
-                  0.01,
-
-              "service":
-                  "WCS 2.0.1",
-
-              "generated_at":
-                  datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-
-              "coverage_count":
-                  len(coverages),
-
-              "matches":
-                  matches,
-
-              "coverages":
-                  coverages
+              "status": "ok",
+              "source": "Météo-France",
+              "model": "AROME",
+              "resolution_deg": 0.01,
+              "service": "WCS 2.0.1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "coverage_count": len(coverages),
+              "matches": matches,
+              "coverages": coverages
           }
 
           with open(
               "arome-capabilities.json",
               "w",
               encoding="utf-8"
-          ) as file:
+          ) as f:
               json.dump(
                   result,
-                  file,
+                  f,
                   ensure_ascii=False,
                   indent=2
               )
 
-          print(
-              "AROME Coverages:",
-              len(coverages)
-          )
+          print("Gefundene Coverages:", len(coverages))
 
           for category, values in matches.items():
-              print(
-                  category,
-                  ":",
-                  len(values)
-              )
+              print(category, len(values))
 
               for value in values[:10]:
-                  print(
-                      "  ",
-                      value
-                  )
+                  print("  ", value)
           PY
 
-      - name: AROME Statusdatei erzeugen
+      - name: AROME Status erzeugen
         run: |
           python3 <<'PY'
           import json
@@ -219,13 +186,10 @@ jobs:
               "arome-capabilities.json",
               "r",
               encoding="utf-8"
-          ) as file:
-              capabilities = json.load(file)
+          ) as f:
+              capabilities = json.load(f)
 
-          matches = capabilities.get(
-              "matches",
-              {}
-          )
+          matches = capabilities.get("matches", {})
 
           required = [
               "temperature",
@@ -238,67 +202,43 @@ jobs:
           ]
 
           available = {
-              key:
-                  bool(
-                      matches.get(
-                          key
-                      )
-                  )
+              key: bool(matches.get(key))
               for key in required
           }
 
           status = {
-              "status":
-                  "ok",
-
-              "source":
-                  "Météo-France",
-
-              "model":
-                  "AROME",
-
-              "resolution_deg":
-                  0.01,
-
-              "generated_at":
-                  datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-
-              "coverage_count":
-                  capabilities.get(
-                      "coverage_count",
-                      0
-                  ),
-
-              "parameters_detected":
-                  available,
-
-              "ready_for_data_download":
-                  all(
-                      available.values()
-                  )
+              "status": "ok",
+              "source": "Météo-France",
+              "model": "AROME",
+              "resolution_deg": 0.01,
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "coverage_count": capabilities.get(
+                  "coverage_count",
+                  0
+              ),
+              "parameters_detected": available,
+              "ready_for_data_download": all(
+                  available.values()
+              )
           }
 
           with open(
               "arome-status.json",
               "w",
               encoding="utf-8"
-          ) as file:
+          ) as f:
               json.dump(
                   status,
-                  file,
+                  f,
                   ensure_ascii=False,
                   indent=2
               )
 
-          print(
-              json.dumps(
-                  status,
-                  ensure_ascii=False,
-                  indent=2
-              )
-          )
+          print(json.dumps(
+              status,
+              ensure_ascii=False,
+              indent=2
+          ))
           PY
 
       - name: AROME Metadaten zu STRATO übertragen
@@ -322,7 +262,5 @@ jobs:
 
       - name: Abschluss
         run: |
-          echo "AROME Authentifizierung funktioniert."
-          echo "AROME 0.01 Capabilities wurden gelesen."
-          echo "Parametererkennung wurde gespeichert."
-          echo "Metadaten liegen auf STRATO."
+          echo "Météo-France Authentifizierung erfolgreich."
+          echo "AROME 0.01 Capabilities ausgewertet."
