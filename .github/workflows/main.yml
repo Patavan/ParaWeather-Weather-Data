@@ -2,6 +2,8 @@ name: ParaWeather ICON-D2 Pipeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
   icon-d2:
@@ -13,10 +15,130 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libeccodes-tools bzip2 sshpass
 
-      - name: ICON-D2 Daten laden
+      - name: Neuesten verfügbaren ICON-D2 Lauf finden
+        id: detect
         run: |
-          RUN=$(date -u +%Y%m%d00)
-          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/00"
+          python3 <<'PY'
+          import urllib.request
+          from datetime import datetime, timezone, timedelta
+          import os
+
+          now = datetime.now(timezone.utc)
+
+          # Auf letzten 3-Stunden-Modelllauf abrunden
+          base_hour = (now.hour // 3) * 3
+          base = now.replace(
+              hour=base_hour,
+              minute=0,
+              second=0,
+              microsecond=0
+          )
+
+          found = None
+
+          # Mehrere vorherige Läufe prüfen,
+          # falls der neueste noch nicht vollständig veröffentlicht ist.
+          for back in range(0, 24, 3):
+              run = base - timedelta(hours=back)
+
+              date = run.strftime("%Y%m%d")
+              hour = run.strftime("%H")
+
+              base_url = (
+                  f"https://opendata.dwd.de/weather/nwp/"
+                  f"icon-d2/grib/{hour}"
+              )
+
+              files = [
+                  f"{base_url}/u_10m/"
+                  f"icon-d2_germany_regular-lat-lon_single-level_"
+                  f"{date}{hour}_000_2d_u_10m.grib2.bz2",
+
+                  f"{base_url}/v_10m/"
+                  f"icon-d2_germany_regular-lat-lon_single-level_"
+                  f"{date}{hour}_000_2d_v_10m.grib2.bz2",
+
+                  f"{base_url}/t_2m/"
+                  f"icon-d2_germany_regular-lat-lon_single-level_"
+                  f"{date}{hour}_000_2d_t_2m.grib2.bz2"
+              ]
+
+              ok = True
+
+              for url in files:
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          method="HEAD"
+                      )
+
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=15
+                      ) as response:
+                          if response.status != 200:
+                              ok = False
+                              break
+
+                  except Exception:
+                      ok = False
+                      break
+
+              if ok:
+                  found = (date, hour)
+                  break
+
+          if found is None:
+              raise RuntimeError(
+                  "Kein vollständiger ICON-D2 Lauf gefunden"
+              )
+
+          date, hour = found
+          run_id = f"{date}{hour}"
+
+          print("Gefundener ICON-D2 Lauf:", run_id)
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a"
+          ) as output:
+              output.write(f"date={date}\n")
+              output.write(f"hour={hour}\n")
+              output.write(f"run_id={run_id}\n")
+          PY
+
+      - name: Prüfen ob Lauf bereits verarbeitet wurde
+        id: changed
+        run: |
+          CURRENT_RUN="${{ steps.detect.outputs.run_id }}"
+
+          REMOTE_RUN=$(
+            curl -fsS \
+            "https://www.orend.org/paraweather-data/icon-d2-run.txt" \
+            2>/dev/null || true
+          )
+
+          echo "DWD Lauf: $CURRENT_RUN"
+          echo "STRATO Lauf: $REMOTE_RUN"
+
+          if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+            echo "Kein neuer Modelllauf."
+            echo "new_data=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Neuer Modelllauf vorhanden."
+            echo "new_data=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ICON-D2 Daten laden
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          DATE="${{ steps.detect.outputs.date }}"
+          HOUR="${{ steps.detect.outputs.hour }}"
+          RUN="${{ steps.detect.outputs.run_id }}"
+
+          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/${HOUR}"
+
+          echo "Verarbeite ICON-D2 Lauf: ${RUN}"
 
           curl -fL \
             "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_u_10m.grib2.bz2" \
@@ -35,12 +157,16 @@ jobs:
           bunzip2 t.grib2.bz2
 
       - name: ICON-D2 Raster auslesen
+        if: steps.changed.outputs.new_data == 'true'
         run: |
           python3 <<'PY'
           import subprocess
           import json
           import math
           from datetime import datetime, timezone
+          import os
+
+          RUN_ID = "${{ steps.detect.outputs.run_id }}"
 
           def read_values(path):
               output = subprocess.check_output(
@@ -64,10 +190,18 @@ jobs:
                   except ValueError:
                       continue
 
-                  rows.append((lat, lon, value))
+                  rows.append(
+                      (
+                          lat,
+                          lon,
+                          value
+                      )
+                  )
 
               if not rows:
-                  raise RuntimeError(f"Keine Rasterdaten aus {path} gelesen")
+                  raise RuntimeError(
+                      f"Keine Rasterdaten aus {path} gelesen"
+                  )
 
               return rows
 
@@ -75,47 +209,88 @@ jobs:
           v_rows = read_values("v.grib2")
           t_rows = read_values("t.grib2")
 
-          if not (len(u_rows) == len(v_rows) == len(t_rows)):
-              raise RuntimeError("ICON-D2 Rastergrößen stimmen nicht überein")
+          if not (
+              len(u_rows) ==
+              len(v_rows) ==
+              len(t_rows)
+          ):
+              raise RuntimeError(
+                  "ICON-D2 Rastergrößen stimmen nicht überein"
+              )
 
           points = []
 
-          # Vorläufig datensparsam: jeder 10. Rasterpunkt
+          # Vorerst datensparsam:
+          # jeder 10. Rasterpunkt.
           step = 10
 
-          for i in range(0, len(u_rows), step):
+          for i in range(
+              0,
+              len(u_rows),
+              step
+          ):
               lat, lon, u = u_rows[i]
               _, _, v = v_rows[i]
               _, _, temp_k = t_rows[i]
 
-              speed_ms = math.sqrt(u * u + v * v)
+              speed_ms = math.sqrt(
+                  u * u +
+                  v * v
+              )
+
               direction = (
-                  math.degrees(math.atan2(-u, -v)) + 360
+                  math.degrees(
+                      math.atan2(
+                          -u,
+                          -v
+                      )
+                  )
+                  + 360
               ) % 360
 
               points.append({
                   "lat": round(lat, 4),
                   "lon": round(lon, 4),
-                  "temperature_c": round(temp_k - 273.15, 1),
-                  "wind_speed_kmh": round(speed_ms * 3.6, 1),
-                  "wind_direction_deg": round(direction)
+                  "temperature_c": round(
+                      temp_k - 273.15,
+                      1
+                  ),
+                  "wind_speed_kmh": round(
+                      speed_ms * 3.6,
+                      1
+                  ),
+                  "wind_direction_deg": round(
+                      direction
+                  )
               })
 
           result = {
               "status": "ok",
               "source": "DWD Open Data",
               "model": "ICON-D2",
-              "generated_at": datetime.now(timezone.utc).isoformat(),
-              "attribution": "Deutscher Wetterdienst (DWD)",
+              "model_run": RUN_ID,
+              "generated_at":
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+              "attribution":
+                  "Deutscher Wetterdienst (DWD)",
               "sampling": {
-                  "original_points": len(u_rows),
-                  "step": step,
-                  "exported_points": len(points)
+                  "original_points":
+                      len(u_rows),
+                  "step":
+                      step,
+                  "exported_points":
+                      len(points)
               },
               "points": points
           }
 
-          with open("icon-d2-grid.json", "w", encoding="utf-8") as f:
+          with open(
+              "icon-d2-grid.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
                   result,
                   f,
@@ -123,13 +298,34 @@ jobs:
                   ensure_ascii=False
               )
 
-          print("Original Rasterpunkte:", len(u_rows))
-          print("Exportierte Rasterpunkte:", len(points))
+          with open(
+              "icon-d2-run.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(RUN_ID)
+
+          print(
+              "Modelllauf:",
+              RUN_ID
+          )
+
+          print(
+              "Original Rasterpunkte:",
+              len(u_rows)
+          )
+
+          print(
+              "Exportierte Rasterpunkte:",
+              len(points)
+          )
           PY
 
       - name: ICON-D2 zu STRATO übertragen
+        if: steps.changed.outputs.new_data == 'true'
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+
         run: |
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
@@ -140,3 +336,16 @@ jobs:
             -o StrictHostKeyChecking=no \
             icon-d2-grid.json \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-grid.json"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            icon-d2-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-run.txt"
+
+      - name: Kein neuer ICON-D2 Lauf
+        if: steps.changed.outputs.new_data == 'false'
+        run: |
+          echo "ICON-D2 ist bereits aktuell."
+          echo "Keine GRIB-Dateien geladen."
+          echo "Keine Daten neu verarbeitet."
+          echo "Kein STRATO-Upload notwendig."
