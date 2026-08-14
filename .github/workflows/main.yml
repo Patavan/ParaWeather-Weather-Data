@@ -1,60 +1,21 @@
-name: ParaWeather ICON-D2 Pipeline
-
-on:
-  workflow_dispatch:
-
-jobs:
-  icon-d2:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Werkzeuge installieren
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libeccodes-tools bzip2 sshpass
-
-      - name: ICON-D2 Daten laden
-        run: |
-          RUN=$(date -u +%Y%m%d00)
-
-          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/00"
-
-          curl -fL \
-            "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_u_10m.grib2.bz2" \
-            -o u.grib2.bz2
-
-          curl -fL \
-            "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_v_10m.grib2.bz2" \
-            -o v.grib2.bz2
-
-          curl -fL \
-            "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_t_2m.grib2.bz2" \
-            -o t.grib2.bz2
-
-          bunzip2 u.grib2.bz2
-          bunzip2 v.grib2.bz2
-          bunzip2 t.grib2.bz2
-
-      - name: Wert für Bingen bestimmen
+      - name: ICON-D2 Raster auslesen
         run: |
           python3 <<'PY'
           import subprocess
-          import math
           import json
+          import math
           from datetime import datetime, timezone
 
-          LAT = 49.966
-          LON = 7.899
-
-          def nearest(path):
-              text = subprocess.check_output(
-                  ["grib_get_data", "-p", "latitude,longitude,value", path],
-                  text=True
+          def read_values(path):
+              output = subprocess.check_output(
+                  ["grib_get_data", path],
+                  text=True,
+                  stderr=subprocess.STDOUT
               )
 
-              best = None
+              rows = []
 
-              for line in text.splitlines():
+              for line in output.splitlines():
                   parts = line.split()
 
                   if len(parts) < 3:
@@ -63,247 +24,61 @@ jobs:
                   try:
                       lat = float(parts[0])
                       lon = float(parts[1])
-                      value = float(parts[2])
+                      value = float(parts[-1])
                   except ValueError:
                       continue
 
-                  d = (lat - LAT) ** 2 + (lon - LON) ** 2
+                  rows.append((lat, lon, value))
 
-                  if best is None or d < best[0]:
-                      best = (d, lat, lon, value)
+              if not rows:
+                  raise RuntimeError(f"Keine Rasterdaten aus {path} gelesen")
 
-              if best is None:
-                  raise RuntimeError(f"Keine Daten in {path}")
+              return rows
 
-              return best
+          u_rows = read_values("u.grib2")
+          v_rows = read_values("v.grib2")
+          t_rows = read_values("t.grib2")
 
-          _, glat, glon, u = nearest("u.grib2")
-          _, _, _, v = nearest("v.grib2")
-          _, _, _, temp_k = nearest("t.grib2")
+          if not (len(u_rows) == len(v_rows) == len(t_rows)):
+              raise RuntimeError("ICON-D2 Rastergrößen stimmen nicht überein")
 
-          speed_ms = math.sqrt(u * u + v * v)
-          speed_kmh = speed_ms * 3.6
+          points = []
 
-          direction = (
-              math.degrees(
-                  math.atan2(-u, -v)
-              ) + 360
-          ) % 360
+          step = 10
+
+          for i in range(0, len(u_rows), step):
+              lat, lon, u = u_rows[i]
+              _, _, v = v_rows[i]
+              _, _, temp_k = t_rows[i]
+
+              speed_ms = math.sqrt(u * u + v * v)
+              direction = (
+                  math.degrees(math.atan2(-u, -v)) + 360
+              ) % 360
+
+              points.append({
+                  "lat": round(lat, 4),
+                  "lon": round(lon, 4),
+                  "temperature_c": round(temp_k - 273.15, 1),
+                  "wind_speed_kmh": round(speed_ms * 3.6, 1),
+                  "wind_direction_deg": round(direction)
+              })
 
           result = {
               "status": "ok",
               "source": "DWD Open Data",
               "model": "ICON-D2",
-
-              "location": {
-                  "name": "Bingen am Rhein",
-                  "latitude": LAT,
-                  "longitude": LON
-              },
-
-              "grid": {
-                  "latitude": glat,
-                  "longitude": glon
-              },
-
-              "weather": {
-                  "temperature_c": round(temp_k - 273.15, 1),
-                  "wind_speed_ms": round(speed_ms, 1),
-                  "wind_speed_kmh": round(speed_kmh, 1),
-                  "wind_direction_deg": round(direction)
-              },
-
-              "generated_at":
-                  datetime.now(timezone.utc).isoformat(),
-
-              "attribution":
-                  "Deutscher Wetterdienst (DWD)"
-          }
-
-          with open(
-              "icon-d2-bingen.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(
-                  result,
-                  f,
-                  indent=2,
-                  ensure_ascii=False
-              )
-
-          print(
-              json.dumps(
-                  result,
-                  indent=2,
-                  ensure_ascii=False
-              )
-          )
-          PY
-
-      - name: Kompaktes ICON-D2 Raster erzeugen
-        run: |
-          python3 <<'PY'
-          import subprocess
-          import json
-          import math
-          from datetime import datetime, timezone
-
-          def read_grid(path):
-              text = subprocess.check_output(
-                  [
-                      "grib_get_data",
-                      "-p",
-                      "latitude,longitude,value",
-                      path
-                  ],
-                  text=True
-              )
-
-              rows = []
-
-              for line in text.splitlines():
-                  parts = line.split()
-
-                  if len(parts) < 3:
-                      continue
-
-                  try:
-                      lat = float(parts[0])
-                      lon = float(parts[1])
-                      value = float(parts[2])
-                  except ValueError:
-                      continue
-
-                  rows.append(
-                      (
-                          lat,
-                          lon,
-                          value
-                      )
-                  )
-
-              return rows
-
-          u_rows = read_grid("u.grib2")
-          v_rows = read_grid("v.grib2")
-          t_rows = read_grid("t.grib2")
-
-          if not (
-              len(u_rows) ==
-              len(v_rows) ==
-              len(t_rows)
-          ):
-              raise RuntimeError(
-                  "ICON-D2 Rastergrößen stimmen nicht überein"
-              )
-
-          points = []
-
-          #
-          # Datensparsame Teststufe:
-          #
-          # Vorerst wird nur jeder 10. Rasterpunkt
-          # exportiert.
-          #
-          # Später können wir den Wert anpassen.
-          #
-          step = 10
-
-          for i in range(
-              0,
-              len(u_rows),
-              step
-          ):
-
-              lat, lon, u = u_rows[i]
-              _, _, v = v_rows[i]
-              _, _, temp_k = t_rows[i]
-
-              speed_ms = math.sqrt(
-                  u * u +
-                  v * v
-              )
-
-              speed_kmh = (
-                  speed_ms *
-                  3.6
-              )
-
-              direction = (
-                  math.degrees(
-                      math.atan2(
-                          -u,
-                          -v
-                      )
-                  )
-                  + 360
-              ) % 360
-
-              points.append(
-                  {
-                      "lat":
-                          round(lat, 4),
-
-                      "lon":
-                          round(lon, 4),
-
-                      "temperature_c":
-                          round(
-                              temp_k - 273.15,
-                              1
-                          ),
-
-                      "wind_speed_kmh":
-                          round(
-                              speed_kmh,
-                              1
-                          ),
-
-                      "wind_direction_deg":
-                          round(direction)
-                  }
-              )
-
-          result = {
-              "status":
-                  "ok",
-
-              "source":
-                  "DWD Open Data",
-
-              "model":
-                  "ICON-D2",
-
-              "generated_at":
-                  datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-
-              "attribution":
-                  "Deutscher Wetterdienst (DWD)",
-
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "attribution": "Deutscher Wetterdienst (DWD)",
               "sampling": {
-                  "original_points":
-                      len(u_rows),
-
-                  "step":
-                      step,
-
-                  "exported_points":
-                      len(points)
+                  "original_points": len(u_rows),
+                  "step": step,
+                  "exported_points": len(points)
               },
-
-              "points":
-                  points
+              "points": points
           }
 
-          with open(
-              "icon-d2-grid.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-
+          with open("icon-d2-grid.json", "w", encoding="utf-8") as f:
               json.dump(
                   result,
                   f,
@@ -311,34 +86,6 @@ jobs:
                   ensure_ascii=False
               )
 
-          print(
-              "Original Rasterpunkte:",
-              len(u_rows)
-          )
-
-          print(
-              "Exportierte Rasterpunkte:",
-              len(points)
-          )
+          print("Original Rasterpunkte:", len(u_rows))
+          print("Exportierte Rasterpunkte:", len(points))
           PY
-
-      - name: Dateien zu STRATO übertragen
-        env:
-          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
-
-        run: |
-
-          sshpass -e ssh \
-            -o StrictHostKeyChecking=no \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
-            "mkdir -p Orend/paraweather-data"
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            icon-d2-bingen.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-bingen.json"
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            icon-d2-grid.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-grid.json"
