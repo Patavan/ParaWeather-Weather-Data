@@ -1,25 +1,129 @@
-name: ParaWeather STRATO Test
+name: ParaWeather ICON-D2 Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  icon-d2:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Testdatei erstellen
+      - name: Werkzeuge installieren
         run: |
-          echo '{"status":"ok","service":"ParaWeather"}' > test.json
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-tools bzip2 sshpass
 
-      - name: Auf STRATO übertragen
+      - name: ICON-D2 Daten laden
+        run: |
+          RUN=$(date -u +%Y%m%d00)
+
+          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/00"
+
+          curl -fL \
+            "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_u_10m.grib2.bz2" \
+            -o u.grib2.bz2
+
+          curl -fL \
+            "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_v_10m.grib2.bz2" \
+            -o v.grib2.bz2
+
+          curl -fL \
+            "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_t_2m.grib2.bz2" \
+            -o t.grib2.bz2
+
+          bunzip2 u.grib2.bz2
+          bunzip2 v.grib2.bz2
+          bunzip2 t.grib2.bz2
+
+      - name: Wert für Bingen bestimmen
+        run: |
+          python3 <<'PY'
+          import subprocess
+          import math
+          import json
+          from datetime import datetime, timezone
+
+          LAT = 49.966
+          LON = 7.899
+
+          def nearest(path):
+              text = subprocess.check_output(
+                  ["grib_get_data", "-p", "latitude,longitude,value", path],
+                  text=True
+              )
+
+              best = None
+
+              for line in text.splitlines():
+                  parts = line.split()
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      lat = float(parts[0])
+                      lon = float(parts[1])
+                      value = float(parts[2])
+                  except ValueError:
+                      continue
+
+                  d = (lat-LAT)**2 + (lon-LON)**2
+
+                  if best is None or d < best[0]:
+                      best = (d, lat, lon, value)
+
+              if best is None:
+                  raise RuntimeError(f"Keine Daten in {path}")
+
+              return best
+
+          _, glat, glon, u = nearest("u.grib2")
+          _, _, _, v = nearest("v.grib2")
+          _, _, _, temp_k = nearest("t.grib2")
+
+          speed_ms = math.sqrt(u*u + v*v)
+          speed_kmh = speed_ms * 3.6
+
+          direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+
+          result = {
+              "status": "ok",
+              "source": "DWD Open Data",
+              "model": "ICON-D2",
+              "location": {
+                  "name": "Bingen am Rhein",
+                  "latitude": LAT,
+                  "longitude": LON
+              },
+              "grid": {
+                  "latitude": glat,
+                  "longitude": glon
+              },
+              "weather": {
+                  "temperature_c": round(temp_k - 273.15, 1),
+                  "wind_speed_ms": round(speed_ms, 1),
+                  "wind_speed_kmh": round(speed_kmh, 1),
+                  "wind_direction_deg": round(direction)
+              },
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "attribution": "Deutscher Wetterdienst (DWD)"
+          }
+
+          with open("icon-d2-bingen.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: JSON zu STRATO übertragen
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mkdir -p Orend/paraweather-data"
+
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
-            -P 22 \
-            test.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/test.json"
+            icon-d2-bingen.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-bingen.json"
