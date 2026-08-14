@@ -2,6 +2,8 @@ name: ParaWeather AROME Pipeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "15 */3 * * *"
 
 jobs:
   arome:
@@ -11,22 +13,52 @@ jobs:
       - name: Werkzeuge installieren
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
+          sudo apt-get install -y -qq curl jq sshpass
+
+      - name: Météo-France Access Token erzeugen
+        id: token
+        env:
+          METEOFRANCE_BASIC_AUTH: ${{ secrets.METEOFRANCE_BASIC_AUTH }}
+        run: |
+          RESPONSE=$(curl -fsS \
+            -X POST \
+            "https://portail-api.meteofrance.fr/token" \
+            -d "grant_type=client_credentials" \
+            -H "Authorization: Basic ${METEOFRANCE_BASIC_AUTH}")
+
+          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "Kein Access Token erhalten."
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+
+          {
+            echo "access_token<<EOF"
+            echo "$ACCESS_TOKEN"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Météo-France Token erfolgreich erzeugt."
 
       - name: AROME 0.01 Capabilities laden
         env:
-          METEOFRANCE_ACCESS_TOKEN: ${{ secrets.METEOFRANCE_ACCESS_TOKEN }}
+          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
         run: |
-          curl -fL \
+          curl -fsSL \
             "https://public-api.meteofrance.fr/public/arome/1.0/wcs/MF-NWP-HIGHRES-AROME-001-FRANCE-WCS/GetCapabilities?service=WCS&version=2.0.1&language=eng" \
-            -H "Authorization: Bearer ${METEOFRANCE_ACCESS_TOKEN}" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             -H "accept: */*" \
             -o arome-capabilities.xml
 
-          echo "AROME Capabilities geladen."
+          test -s arome-capabilities.xml
+
+          echo "AROME Capabilities erfolgreich geladen."
           ls -lh arome-capabilities.xml
 
-      - name: AROME Coverages auslesen
+      - name: AROME Coverages analysieren
         run: |
           python3 <<'PY'
           import json
@@ -41,48 +73,235 @@ jobs:
           for element in root.iter():
               tag = element.tag.split("}")[-1]
 
-              if tag in ("CoverageId", "Identifier"):
-                  if element.text:
-                      value = element.text.strip()
+              if tag in (
+                  "CoverageId",
+                  "Identifier"
+              ):
+                  value = (
+                      element.text.strip()
+                      if element.text
+                      else ""
+                  )
 
-                      if value and value not in coverages:
-                          coverages.append(value)
+                  if value and value not in coverages:
+                      coverages.append(value)
+
+          keywords = {
+              "temperature": [
+                  "TEMPERATURE",
+                  "T2M",
+                  "2M"
+              ],
+
+              "wind_u": [
+                  "UGRD",
+                  "U_COMPONENT",
+                  "U10"
+              ],
+
+              "wind_v": [
+                  "VGRD",
+                  "V_COMPONENT",
+                  "V10"
+              ],
+
+              "gust": [
+                  "GUST",
+                  "RAF",
+                  "VMAX"
+              ],
+
+              "precipitation": [
+                  "PRECIP",
+                  "RAIN",
+                  "RR",
+                  "TP"
+              ],
+
+              "cloud": [
+                  "CLOUD",
+                  "NEB",
+                  "CLCT"
+              ],
+
+              "pressure": [
+                  "PRESSURE",
+                  "PMSL",
+                  "MSL"
+              ]
+          }
+
+          matches = {}
+
+          for category, words in keywords.items():
+              matches[category] = []
+
+              for coverage in coverages:
+                  upper = coverage.upper()
+
+                  if any(
+                      word in upper
+                      for word in words
+                  ):
+                      matches[category].append(
+                          coverage
+                      )
 
           result = {
-              "status": "ok",
-              "source": "Météo-France",
-              "model": "AROME",
-              "resolution_deg": 0.01,
-              "service": "WCS 2.0.1",
-              "generated_at": datetime.now(
-                  timezone.utc
-              ).isoformat(),
-              "coverage_count": len(coverages),
-              "coverages": coverages
+              "status":
+                  "ok",
+
+              "source":
+                  "Météo-France",
+
+              "model":
+                  "AROME",
+
+              "resolution_deg":
+                  0.01,
+
+              "service":
+                  "WCS 2.0.1",
+
+              "generated_at":
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+
+              "coverage_count":
+                  len(coverages),
+
+              "matches":
+                  matches,
+
+              "coverages":
+                  coverages
           }
 
           with open(
               "arome-capabilities.json",
               "w",
               encoding="utf-8"
-          ) as f:
+          ) as file:
               json.dump(
                   result,
-                  f,
-                  indent=2,
-                  ensure_ascii=False
+                  file,
+                  ensure_ascii=False,
+                  indent=2
               )
 
           print(
-              "Gefundene AROME Coverages:",
+              "AROME Coverages:",
               len(coverages)
           )
 
-          for item in coverages:
-              print(item)
+          for category, values in matches.items():
+              print(
+                  category,
+                  ":",
+                  len(values)
+              )
+
+              for value in values[:10]:
+                  print(
+                      "  ",
+                      value
+                  )
           PY
 
-      - name: AROME Informationen zu STRATO übertragen
+      - name: AROME Statusdatei erzeugen
+        run: |
+          python3 <<'PY'
+          import json
+          from datetime import datetime, timezone
+
+          with open(
+              "arome-capabilities.json",
+              "r",
+              encoding="utf-8"
+          ) as file:
+              capabilities = json.load(file)
+
+          matches = capabilities.get(
+              "matches",
+              {}
+          )
+
+          required = [
+              "temperature",
+              "wind_u",
+              "wind_v",
+              "gust",
+              "precipitation",
+              "cloud",
+              "pressure"
+          ]
+
+          available = {
+              key:
+                  bool(
+                      matches.get(
+                          key
+                      )
+                  )
+              for key in required
+          }
+
+          status = {
+              "status":
+                  "ok",
+
+              "source":
+                  "Météo-France",
+
+              "model":
+                  "AROME",
+
+              "resolution_deg":
+                  0.01,
+
+              "generated_at":
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+
+              "coverage_count":
+                  capabilities.get(
+                      "coverage_count",
+                      0
+                  ),
+
+              "parameters_detected":
+                  available,
+
+              "ready_for_data_download":
+                  all(
+                      available.values()
+                  )
+          }
+
+          with open(
+              "arome-status.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+              json.dump(
+                  status,
+                  file,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(
+              json.dumps(
+                  status,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+          PY
+
+      - name: AROME Metadaten zu STRATO übertragen
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
         run: |
@@ -95,3 +314,15 @@ jobs:
             -o StrictHostKeyChecking=no \
             arome-capabilities.json \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-capabilities.json"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            arome-status.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-status.json"
+
+      - name: Abschluss
+        run: |
+          echo "AROME Authentifizierung funktioniert."
+          echo "AROME 0.01 Capabilities wurden gelesen."
+          echo "Parametererkennung wurde gespeichert."
+          echo "Metadaten liegen auf STRATO."
