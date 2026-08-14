@@ -25,6 +25,7 @@ jobs:
 
           now = datetime.now(timezone.utc)
           base_hour = (now.hour // 3) * 3
+
           base = now.replace(
               hour=base_hour,
               minute=0,
@@ -32,7 +33,7 @@ jobs:
               microsecond=0
           )
 
-          fields = [
+          surface_fields = [
               "u_10m",
               "v_10m",
               "t_2m",
@@ -45,7 +46,9 @@ jobs:
           found = None
 
           for back in range(0, 24, 3):
+
               run = base - timedelta(hours=back)
+
               date = run.strftime("%Y%m%d")
               hour = run.strftime("%H")
 
@@ -56,7 +59,8 @@ jobs:
 
               complete = True
 
-              for field in fields:
+              for field in surface_fields:
+
                   url = (
                       f"{root}/{field}/"
                       f"icon-d2_germany_regular-lat-lon_single-level_"
@@ -64,33 +68,60 @@ jobs:
                   )
 
                   try:
-                      req = urllib.request.Request(url, method="HEAD")
-                      with urllib.request.urlopen(req, timeout=15) as response:
+                      request = urllib.request.Request(
+                          url,
+                          method="HEAD"
+                      )
+
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=15
+                      ) as response:
+
                           if response.status != 200:
                               complete = False
                               break
+
                   except Exception:
                       complete = False
                       break
 
               if complete:
-                  found = (date, hour)
+                  found = (
+                      date,
+                      hour
+                  )
                   break
 
           if found is None:
               raise RuntimeError(
-                  "Kein vollständiger ICON-D2 24h-Lauf gefunden"
+                  "Kein vollständiger ICON-D2 Lauf gefunden"
               )
 
           date, hour = found
           run_id = f"{date}{hour}"
 
-          print("Gefundener ICON-D2 Lauf:", run_id)
+          print(
+              "Gefundener ICON-D2 Lauf:",
+              run_id
+          )
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"date={date}\n")
-              output.write(f"hour={hour}\n")
-              output.write(f"run_id={run_id}\n")
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a"
+          ) as output:
+
+              output.write(
+                  f"date={date}\n"
+              )
+
+              output.write(
+                  f"hour={hour}\n"
+              )
+
+              output.write(
+                  f"run_id={run_id}\n"
+              )
           PY
 
       - name: Prüfen ob Lauf bereits verarbeitet wurde
@@ -108,39 +139,174 @@ jobs:
           echo "STRATO Lauf: $REMOTE_RUN"
 
           if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+
             echo "Kein neuer Modelllauf."
-            echo "new_data=false" >> "$GITHUB_OUTPUT"
+
+            echo \
+              "new_data=false" \
+              >> "$GITHUB_OUTPUT"
+
           else
+
             echo "Neuer Modelllauf vorhanden."
-            echo "new_data=true" >> "$GITHUB_OUTPUT"
+
+            echo \
+              "new_data=true" \
+              >> "$GITHUB_OUTPUT"
+
           fi
 
-      - name: ICON-D2 Daten 0-24h laden
+      - name: ICON-D2 Bodenwetter 0-24h laden
         if: steps.changed.outputs.new_data == 'true'
         run: |
           HOUR="${{ steps.detect.outputs.hour }}"
           RUN="${{ steps.detect.outputs.run_id }}"
+
           BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/${HOUR}"
 
-          mkdir -p grib
+          mkdir -p grib/surface
 
           FIELDS="u_10m v_10m t_2m vmax_10m tot_prec clct pmsl"
 
           for STEP in $(seq 0 24); do
+
             FSTEP=$(printf "%03d" "$STEP")
 
-            echo "Lade ICON-D2 ${RUN} +${FSTEP}h"
+            echo "Lade Bodenfelder +${FSTEP}h"
 
             for FIELD in $FIELDS; do
+
               curl -fL \
                 "$BASE/$FIELD/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_${FIELD}.grib2.bz2" \
-                -o "grib/${FIELD}_${FSTEP}.grib2.bz2"
+                -o "grib/surface/${FIELD}_${FSTEP}.grib2.bz2"
 
-              bunzip2 "grib/${FIELD}_${FSTEP}.grib2.bz2"
+              bunzip2 \
+                "grib/surface/${FIELD}_${FSTEP}.grib2.bz2"
+
             done
           done
 
-      - name: ICON-D2 Kacheln erzeugen
+      - name: ICON-D2 Höhenwind-Dateien laden
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          HOUR="${{ steps.detect.outputs.hour }}"
+          RUN="${{ steps.detect.outputs.run_id }}"
+
+          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/${HOUR}"
+
+          mkdir -p grib/upper
+
+          for STEP in $(seq 0 24); do
+
+            FSTEP=$(printf "%03d" "$STEP")
+
+            echo "Lade Modelllevel-Wind +${FSTEP}h"
+
+            curl -fL \
+              "$BASE/u/icon-d2_germany_regular-lat-lon_model-level_${RUN}_${FSTEP}_u.grib2.bz2" \
+              -o "grib/upper/u_${FSTEP}.grib2.bz2"
+
+            curl -fL \
+              "$BASE/v/icon-d2_germany_regular-lat-lon_model-level_${RUN}_${FSTEP}_v.grib2.bz2" \
+              -o "grib/upper/v_${FSTEP}.grib2.bz2"
+
+            bunzip2 \
+              "grib/upper/u_${FSTEP}.grib2.bz2"
+
+            bunzip2 \
+              "grib/upper/v_${FSTEP}.grib2.bz2"
+
+          done
+
+      - name: Verfügbare Modelllevel bestimmen
+        if: steps.changed.outputs.new_data == 'true'
+        id: levels
+        run: |
+          python3 <<'PY'
+          import subprocess
+          import os
+
+          path = "grib/upper/u_000.grib2"
+
+          output = subprocess.check_output(
+              [
+                  "grib_get",
+                  "-p",
+                  "level",
+                  path
+              ],
+              text=True,
+              stderr=subprocess.STDOUT
+          )
+
+          levels = []
+
+          for line in output.splitlines():
+
+              try:
+                  level = int(
+                      float(
+                          line.strip()
+                      )
+                  )
+
+                  if level not in levels:
+                      levels.append(level)
+
+              except ValueError:
+                  pass
+
+          levels = sorted(
+              levels
+          )
+
+          if not levels:
+              raise RuntimeError(
+                  "Keine ICON-D2 Modelllevel gefunden"
+              )
+
+          print(
+              "Verfügbare Modelllevel:",
+              levels
+          )
+
+          #
+          # Für den ersten ParaWeather-Höhenwindexport
+          # nehmen wir mehrere Level im unteren Teil
+          # der Atmosphäre.
+          #
+          # Keine erfundenen Meter- oder hPa-Angaben.
+          #
+          count = min(
+              6,
+              len(levels)
+          )
+
+          selected = levels[
+              -count:
+          ]
+
+          print(
+              "Verwendete Modelllevel:",
+              selected
+          )
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a"
+          ) as output_file:
+
+              output_file.write(
+                  "selected="
+                  + ",".join(
+                      str(x)
+                      for x in selected
+                  )
+                  + "\n"
+              )
+          PY
+
+      - name: ICON-D2 ParaWeather Kacheln erzeugen
         if: steps.changed.outputs.new_data == 'true'
         run: |
           python3 <<'PY'
@@ -148,20 +314,41 @@ jobs:
           import json
           import math
           import os
-          from datetime import datetime, timezone, timedelta
+
+          from datetime import (
+              datetime,
+              timezone,
+              timedelta
+          )
 
           RUN_ID = "${{ steps.detect.outputs.run_id }}"
+
+          SELECTED_LEVELS = [
+              int(x)
+              for x in
+              "${{ steps.levels.outputs.selected }}".split(",")
+              if x
+          ]
 
           run_time = datetime.strptime(
               RUN_ID,
               "%Y%m%d%H"
-          ).replace(tzinfo=timezone.utc)
+          ).replace(
+              tzinfo=timezone.utc
+          )
 
-          os.makedirs("tiles", exist_ok=True)
+          os.makedirs(
+              "tiles",
+              exist_ok=True
+          )
 
           def read_values(path):
+
               output = subprocess.check_output(
-                  ["grib_get_data", path],
+                  [
+                      "grib_get_data",
+                      path
+                  ],
                   text=True,
                   stderr=subprocess.STDOUT
               )
@@ -169,73 +356,170 @@ jobs:
               rows = []
 
               for line in output.splitlines():
+
                   parts = line.split()
 
                   if len(parts) < 3:
                       continue
 
                   try:
-                      lat = float(parts[0])
-                      lon = float(parts[1])
-                      value = float(parts[-1])
+
+                      lat = float(
+                          parts[0]
+                      )
+
+                      lon = float(
+                          parts[1]
+                      )
+
+                      value = float(
+                          parts[-1]
+                      )
+
                   except ValueError:
                       continue
 
-                  rows.append((lat, lon, value))
+                  rows.append(
+                      (
+                          lat,
+                          lon,
+                          value
+                      )
+                  )
 
               if not rows:
+
                   raise RuntimeError(
-                      f"Keine Rasterdaten aus {path} gelesen"
+                      f"Keine Rasterdaten aus {path}"
                   )
 
               return rows
 
-          def tile_name(lat, lon):
-              lat_floor = math.floor(lat)
-              lon_floor = math.floor(lon)
+          def read_model_level(
+              path,
+              level
+          ):
 
-              lat_prefix = "N" if lat_floor >= 0 else "S"
-              lon_prefix = "E" if lon_floor >= 0 else "W"
+              temp = (
+                  f"/tmp/"
+                  f"{os.path.basename(path)}_"
+                  f"{level}.grib2"
+              )
+
+              subprocess.check_call(
+                  [
+                      "grib_copy",
+                      "-w",
+                      f"level={level}",
+                      path,
+                      temp
+                  ],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL
+              )
+
+              rows = read_values(
+                  temp
+              )
+
+              os.remove(
+                  temp
+              )
+
+              return rows
+
+          def tile_name(
+              lat,
+              lon
+          ):
+
+              lat_floor = math.floor(
+                  lat
+              )
+
+              lon_floor = math.floor(
+                  lon
+              )
 
               return (
-                  f"{lat_prefix}{abs(lat_floor):02d}_"
-                  f"{lon_prefix}{abs(lon_floor):03d}"
+                  ("N" if lat_floor >= 0 else "S")
+                  + f"{abs(lat_floor):02d}_"
+                  + ("E" if lon_floor >= 0 else "W")
+                  + f"{abs(lon_floor):03d}"
               )
 
           sampling_step = 10
+
           tiles = {}
 
-          for forecast_hour in range(25):
-              fstep = f"{forecast_hour:03d}"
+          for forecast_hour in range(
+              25
+          ):
 
-              print("Verarbeite +", fstep, "h")
+              fstep = (
+                  f"{forecast_hour:03d}"
+              )
 
-              u_rows = read_values(f"grib/u_10m_{fstep}.grib2")
-              v_rows = read_values(f"grib/v_10m_{fstep}.grib2")
-              t_rows = read_values(f"grib/t_2m_{fstep}.grib2")
-              gust_rows = read_values(f"grib/vmax_10m_{fstep}.grib2")
-              precip_rows = read_values(f"grib/tot_prec_{fstep}.grib2")
-              cloud_rows = read_values(f"grib/clct_{fstep}.grib2")
-              pressure_rows = read_values(f"grib/pmsl_{fstep}.grib2")
+              print(
+                  "Verarbeite +",
+                  fstep,
+                  "h"
+              )
 
-              lengths = {
-                  len(u_rows),
-                  len(v_rows),
-                  len(t_rows),
-                  len(gust_rows),
-                  len(precip_rows),
-                  len(cloud_rows),
-                  len(pressure_rows)
-              }
+              u_rows = read_values(
+                  f"grib/surface/u_10m_{fstep}.grib2"
+              )
 
-              if len(lengths) != 1:
-                  raise RuntimeError(
-                      f"Rastergrößen bei +{fstep}h stimmen nicht überein"
+              v_rows = read_values(
+                  f"grib/surface/v_10m_{fstep}.grib2"
+              )
+
+              t_rows = read_values(
+                  f"grib/surface/t_2m_{fstep}.grib2"
+              )
+
+              gust_rows = read_values(
+                  f"grib/surface/vmax_10m_{fstep}.grib2"
+              )
+
+              precip_rows = read_values(
+                  f"grib/surface/tot_prec_{fstep}.grib2"
+              )
+
+              cloud_rows = read_values(
+                  f"grib/surface/clct_{fstep}.grib2"
+              )
+
+              pressure_rows = read_values(
+                  f"grib/surface/pmsl_{fstep}.grib2"
+              )
+
+              upper = {}
+
+              for level in SELECTED_LEVELS:
+
+                  upper_u = read_model_level(
+                      f"grib/upper/u_{fstep}.grib2",
+                      level
+                  )
+
+                  upper_v = read_model_level(
+                      f"grib/upper/v_{fstep}.grib2",
+                      level
+                  )
+
+                  upper[
+                      level
+                  ] = (
+                      upper_u,
+                      upper_v
                   )
 
               valid_time = (
-                  run_time +
-                  timedelta(hours=forecast_hour)
+                  run_time
+                  + timedelta(
+                      hours=forecast_hour
+                  )
               ).isoformat()
 
               for i in range(
@@ -243,115 +527,271 @@ jobs:
                   len(u_rows),
                   sampling_step
               ):
-                  lat, lon, u = u_rows[i]
-                  _, _, v = v_rows[i]
-                  _, _, temp_k = t_rows[i]
-                  _, _, gust_ms = gust_rows[i]
-                  _, _, precip = precip_rows[i]
-                  _, _, cloud = cloud_rows[i]
-                  _, _, pressure_pa = pressure_rows[i]
 
-                  tile = tile_name(lat, lon)
+                  lat, lon, u = (
+                      u_rows[i]
+                  )
+
+                  _, _, v = (
+                      v_rows[i]
+                  )
+
+                  _, _, temp_k = (
+                      t_rows[i]
+                  )
+
+                  _, _, gust_ms = (
+                      gust_rows[i]
+                  )
+
+                  _, _, precip = (
+                      precip_rows[i]
+                  )
+
+                  _, _, cloud = (
+                      cloud_rows[i]
+                  )
+
+                  _, _, pressure_pa = (
+                      pressure_rows[i]
+                  )
+
+                  tile = tile_name(
+                      lat,
+                      lon
+                  )
 
                   if tile not in tiles:
                       tiles[tile] = {}
 
-                  key = f"{round(lat,4)},{round(lon,4)}"
+                  point_key = (
+                      f"{round(lat,4)},"
+                      f"{round(lon,4)}"
+                  )
 
-                  if key not in tiles[tile]:
-                      tiles[tile][key] = {
-                          "lat": round(lat, 4),
-                          "lon": round(lon, 4),
-                          "forecast": []
+                  if (
+                      point_key
+                      not in tiles[tile]
+                  ):
+
+                      tiles[
+                          tile
+                      ][
+                          point_key
+                      ] = {
+                          "lat":
+                              round(
+                                  lat,
+                                  4
+                              ),
+
+                          "lon":
+                              round(
+                                  lon,
+                                  4
+                              ),
+
+                          "forecast":
+                              []
                       }
 
                   wind_ms = math.sqrt(
-                      u * u +
-                      v * v
+                      u*u
+                      + v*v
                   )
 
                   direction = (
                       math.degrees(
-                          math.atan2(-u, -v)
-                      ) + 360
+                          math.atan2(
+                              -u,
+                              -v
+                          )
+                      )
+                      + 360
                   ) % 360
 
-                  tiles[tile][key]["forecast"].append({
-                      "hour": forecast_hour,
-                      "valid_time": valid_time,
+                  height_wind = []
+
+                  for level in SELECTED_LEVELS:
+
+                      level_u = (
+                          upper[
+                              level
+                          ][0][i][2]
+                      )
+
+                      level_v = (
+                          upper[
+                              level
+                          ][1][i][2]
+                      )
+
+                      level_speed = (
+                          math.sqrt(
+                              level_u*level_u
+                              + level_v*level_v
+                          )
+                      )
+
+                      level_direction = (
+                          math.degrees(
+                              math.atan2(
+                                  -level_u,
+                                  -level_v
+                              )
+                          )
+                          + 360
+                      ) % 360
+
+                      height_wind.append({
+                          "type":
+                              "model_level",
+
+                          "level":
+                              level,
+
+                          "wind_speed_kmh":
+                              round(
+                                  level_speed
+                                  * 3.6,
+                                  1
+                              ),
+
+                          "wind_direction_deg":
+                              round(
+                                  level_direction
+                              )
+                      })
+
+                  tiles[
+                      tile
+                  ][
+                      point_key
+                  ][
+                      "forecast"
+                  ].append({
+
+                      "hour":
+                          forecast_hour,
+
+                      "valid_time":
+                          valid_time,
 
                       "temperature_c":
-                          round(temp_k - 273.15, 1),
+                          round(
+                              temp_k
+                              - 273.15,
+                              1
+                          ),
 
                       "wind_speed_kmh":
-                          round(wind_ms * 3.6, 1),
+                          round(
+                              wind_ms
+                              * 3.6,
+                              1
+                          ),
 
                       "wind_direction_deg":
-                          round(direction),
+                          round(
+                              direction
+                          ),
 
                       "wind_gust_kmh":
-                          round(gust_ms * 3.6, 1),
+                          round(
+                              gust_ms
+                              * 3.6,
+                              1
+                          ),
 
                       "precipitation_mm":
-                          round(max(precip, 0.0), 2),
+                          round(
+                              max(
+                                  precip,
+                                  0.0
+                              ),
+                              2
+                          ),
 
                       "cloud_cover_percent":
                           round(
                               max(
                                   0.0,
-                                  min(100.0, cloud)
+                                  min(
+                                      100.0,
+                                      cloud
+                                  )
                               ),
                               1
                           ),
 
                       "pressure_msl_hpa":
                           round(
-                              pressure_pa / 100.0,
+                              pressure_pa
+                              / 100.0,
                               1
-                          )
+                          ),
+
+                      "height_wind":
+                          height_wind
                   })
 
-          generated_at = datetime.now(
-              timezone.utc
-          ).isoformat()
+          generated_at = (
+              datetime.now(
+                  timezone.utc
+              ).isoformat()
+          )
 
-          index_tiles = []
+          tile_names = []
+
           total_points = 0
 
           for tile, point_map in tiles.items():
+
+              tile_names.append(
+                  tile
+              )
 
               points = list(
                   point_map.values()
               )
 
-              total_points += len(points)
-              index_tiles.append(tile)
+              total_points += len(
+                  points
+              )
 
               output = {
-                  "status": "ok",
-                  "source": "DWD Open Data",
-                  "model": "ICON-D2",
-                  "model_run": RUN_ID,
-                  "tile": tile,
+                  "status":
+                      "ok",
 
-                  "forecast_hours": 24,
-                  "forecast_interval_hours": 1,
+                  "source":
+                      "DWD Open Data",
+
+                  "model":
+                      "ICON-D2",
+
+                  "model_run":
+                      RUN_ID,
+
+                  "tile":
+                      tile,
+
+                  "forecast_hours":
+                      24,
+
+                  "forecast_interval_hours":
+                      1,
+
+                  "vertical_wind_type":
+                      "ICON-D2 model levels",
+
+                  "vertical_model_levels":
+                      SELECTED_LEVELS,
 
                   "generated_at":
                       generated_at,
 
                   "attribution":
                       "Deutscher Wetterdienst (DWD)",
-
-                  "parameters": [
-                      "temperature_c",
-                      "wind_speed_kmh",
-                      "wind_direction_deg",
-                      "wind_gust_kmh",
-                      "precipitation_mm",
-                      "cloud_cover_percent",
-                      "pressure_msl_hpa"
-                  ],
 
                   "sampling_step":
                       sampling_step,
@@ -364,49 +804,73 @@ jobs:
                   f"tiles/{tile}.json",
                   "w",
                   encoding="utf-8"
-              ) as f:
+              ) as file:
+
                   json.dump(
                       output,
-                      f,
-                      separators=(",", ":"),
+                      file,
+                      separators=(
+                          ",",
+                          ":"
+                      ),
                       ensure_ascii=False
                   )
 
           index = {
-              "status": "ok",
-              "source": "DWD Open Data",
-              "model": "ICON-D2",
-              "model_run": RUN_ID,
+              "status":
+                  "ok",
+
+              "source":
+                  "DWD Open Data",
+
+              "model":
+                  "ICON-D2",
+
+              "model_run":
+                  RUN_ID,
 
               "generated_at":
                   generated_at,
 
-              "tile_size_degrees": 1,
-              "tile_count": len(index_tiles),
-              "total_points": total_points,
+              "tile_count":
+                  len(
+                      tile_names
+                  ),
 
-              "forecast_hours": 24,
-              "forecast_interval_hours": 1,
+              "total_points":
+                  total_points,
 
-              "sampling_step":
-                  sampling_step,
+              "forecast_hours":
+                  24,
+
+              "vertical_wind_type":
+                  "ICON-D2 model levels",
+
+              "vertical_model_levels":
+                  SELECTED_LEVELS,
 
               "attribution":
                   "Deutscher Wetterdienst (DWD)",
 
               "tiles":
-                  sorted(index_tiles)
+                  sorted(
+                      tile_names
+                  )
           }
 
           with open(
               "icon-d2-index.json",
               "w",
               encoding="utf-8"
-          ) as f:
+          ) as file:
+
               json.dump(
                   index,
-                  f,
-                  separators=(",", ":"),
+                  file,
+                  separators=(
+                      ",",
+                      ":"
+                  ),
                   ensure_ascii=False
               )
 
@@ -414,24 +878,41 @@ jobs:
               "icon-d2-tiles-run.txt",
               "w",
               encoding="utf-8"
-          ) as f:
-              f.write(RUN_ID)
+          ) as file:
 
-          print("Modelllauf:", RUN_ID)
-          print("Kacheln:", len(index_tiles))
-          print("Rasterpunkte:", total_points)
+              file.write(
+                  RUN_ID
+              )
+
+          print(
+              "ICON-D2 Modelllauf:",
+              RUN_ID
+          )
+
+          print(
+              "Modelllevel:",
+              SELECTED_LEVELS
+          )
+
+          print(
+              "Kacheln:",
+              len(
+                  tile_names
+              )
+          )
           PY
 
       - name: Kachelarchiv erstellen
         if: steps.changed.outputs.new_data == 'true'
         run: |
-          tar -czf icon-d2-tiles.tar.gz tiles
+          tar -czf \
+            icon-d2-tiles.tar.gz \
+            tiles
 
-          ls -lh icon-d2-tiles.tar.gz
-          echo -n "Kachelanzahl: "
-          ls tiles | wc -l
+          ls -lh \
+            icon-d2-tiles.tar.gz
 
-      - name: ICON-D2 Kacheln zu STRATO übertragen
+      - name: ICON-D2 zu STRATO übertragen
         if: steps.changed.outputs.new_data == 'true'
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
@@ -479,7 +960,5 @@ jobs:
       - name: Kein neuer ICON-D2 Lauf
         if: steps.changed.outputs.new_data == 'false'
         run: |
-          echo "ICON-D2 Kacheldaten sind bereits aktuell."
-          echo "Keine GRIB-Dateien geladen."
+          echo "ICON-D2 ist bereits aktuell."
           echo "Keine Daten neu verarbeitet."
-          echo "Kein STRATO-Upload notwendig."
