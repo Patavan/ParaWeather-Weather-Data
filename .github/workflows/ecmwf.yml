@@ -1,1 +1,437 @@
+name: ParaWeather ECMWF IFS Pipeline
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 */6 * * *"
+
+jobs:
+  ecmwf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-tools sshpass
+          python3 -m pip install --quiet ecmwf-opendata
+
+      - name: Neuesten ECMWF IFS Lauf bestimmen
+        id: detect
+        run: |
+          python3 <<'PY'
+          from ecmwf.opendata import Client
+          import os
+
+          client = Client(
+              source="ecmwf",
+              model="ifs",
+              resol="0p25"
+          )
+
+          latest = client.latest(
+              type="fc",
+              stream="oper",
+              step=24
+          )
+
+          run_id = latest.strftime("%Y%m%d%H")
+
+          print("Neuester ECMWF IFS Lauf:", run_id)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run_id={run_id}\n")
+              f.write(f"date={latest.strftime('%Y%m%d')}\n")
+              f.write(f"time={latest.strftime('%H')}\n")
+          PY
+
+      - name: Prüfen ob Lauf bereits verarbeitet wurde
+        id: changed
+        run: |
+          CURRENT_RUN="${{ steps.detect.outputs.run_id }}"
+
+          REMOTE_RUN=$(
+            curl -fsS \
+            "https://www.orend.org/paraweather-data/ecmwf-ifs-run.txt" \
+            2>/dev/null || true
+          )
+
+          echo "ECMWF Lauf: $CURRENT_RUN"
+          echo "STRATO Lauf: $REMOTE_RUN"
+
+          if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+            echo "Kein neuer Modelllauf."
+            echo "new_data=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Neuer Modelllauf vorhanden."
+            echo "new_data=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ECMWF IFS 0-24h laden
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          python3 <<'PY'
+          from ecmwf.opendata import Client
+
+          date = "${{ steps.detect.outputs.date }}"
+          time = "${{ steps.detect.outputs.time }}"
+
+          client = Client(
+              source="ecmwf",
+              model="ifs",
+              resol="0p25"
+          )
+
+          steps = list(range(0, 25, 3))
+
+          client.retrieve(
+              date=date,
+              time=time,
+              stream="oper",
+              type="fc",
+              step=steps,
+              param=[
+                  "10u",
+                  "10v",
+                  "2t",
+                  "msl",
+                  "tp",
+                  "tcc"
+              ],
+              target="ecmwf-ifs.grib2"
+          )
+
+          print("ECMWF IFS Daten geladen.")
+          PY
+
+      - name: ECMWF IFS Kacheln erzeugen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          python3 <<'PY'
+          import subprocess
+          import json
+          import math
+          import os
+          from datetime import datetime, timezone, timedelta
+
+          RUN_ID = "${{ steps.detect.outputs.run_id }}"
+
+          run_time = datetime.strptime(
+              RUN_ID,
+              "%Y%m%d%H"
+          ).replace(tzinfo=timezone.utc)
+
+          os.makedirs("ecmwf-tiles", exist_ok=True)
+
+          def grib_messages(path):
+              output = subprocess.check_output(
+                  [
+                      "grib_ls",
+                      "-p",
+                      "shortName,stepRange",
+                      path
+                  ],
+                  text=True
+              )
+              return output
+
+          print(grib_messages("ecmwf-ifs.grib2"))
+
+          def extract(param, step):
+              temp = f"/tmp/{param}_{step}.grib2"
+
+              subprocess.check_call(
+                  [
+                      "grib_copy",
+                      "-w",
+                      f"shortName={param},stepRange={step}",
+                      "ecmwf-ifs.grib2",
+                      temp
+                  ],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL
+              )
+
+              output = subprocess.check_output(
+                  ["grib_get_data", temp],
+                  text=True,
+                  stderr=subprocess.STDOUT
+              )
+
+              try:
+                  os.remove(temp)
+              except OSError:
+                  pass
+
+              rows = []
+
+              for line in output.splitlines():
+                  parts = line.split()
+
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      lat = float(parts[0])
+                      lon = float(parts[1])
+                      value = float(parts[-1])
+                  except ValueError:
+                      continue
+
+                  rows.append((lat, lon, value))
+
+              if not rows:
+                  raise RuntimeError(
+                      f"Keine ECMWF-Daten für {param} Schritt {step}"
+                  )
+
+              return rows
+
+          def tile_name(lat, lon):
+              lat_floor = math.floor(lat)
+              lon_floor = math.floor(lon)
+
+              return (
+                  ("N" if lat_floor >= 0 else "S")
+                  + f"{abs(lat_floor):02d}_"
+                  + ("E" if lon_floor >= 0 else "W")
+                  + f"{abs(lon_floor):03d}"
+              )
+
+          tiles = {}
+
+          # ECMWF: zunächst 3-stündlich 0-24h
+          forecast_steps = list(range(0, 25, 3))
+
+          for step in forecast_steps:
+              print("Verarbeite ECMWF +", step, "h")
+
+              u_rows = extract("10u", step)
+              v_rows = extract("10v", step)
+              t_rows = extract("2t", step)
+              p_rows = extract("msl", step)
+              tp_rows = extract("tp", step)
+              cloud_rows = extract("tcc", step)
+
+              sizes = {
+                  len(u_rows),
+                  len(v_rows),
+                  len(t_rows),
+                  len(p_rows),
+                  len(tp_rows),
+                  len(cloud_rows)
+              }
+
+              if len(sizes) != 1:
+                  raise RuntimeError(
+                      f"ECMWF Rastergrößen bei +{step}h stimmen nicht überein"
+                  )
+
+              valid_time = (
+                  run_time +
+                  timedelta(hours=step)
+              ).isoformat()
+
+              for i in range(len(u_rows)):
+                  lat, lon, u = u_rows[i]
+                  _, _, v = v_rows[i]
+                  _, _, temp_k = t_rows[i]
+                  _, _, pressure_pa = p_rows[i]
+                  _, _, precip_m = tp_rows[i]
+                  _, _, cloud_fraction = cloud_rows[i]
+
+                  # Nur Europa für ParaWeather V1
+                  if not (35.0 <= lat <= 72.0 and -12.0 <= lon <= 32.0):
+                      continue
+
+                  tile = tile_name(lat, lon)
+
+                  if tile not in tiles:
+                      tiles[tile] = {}
+
+                  key = f"{round(lat,3)},{round(lon,3)}"
+
+                  if key not in tiles[tile]:
+                      tiles[tile][key] = {
+                          "lat": round(lat, 3),
+                          "lon": round(lon, 3),
+                          "forecast": []
+                      }
+
+                  speed_ms = math.sqrt(u*u + v*v)
+
+                  direction = (
+                      math.degrees(
+                          math.atan2(-u, -v)
+                      ) + 360
+                  ) % 360
+
+                  tiles[tile][key]["forecast"].append({
+                      "hour": step,
+                      "valid_time": valid_time,
+
+                      "temperature_c":
+                          round(temp_k - 273.15, 1),
+
+                      "wind_speed_kmh":
+                          round(speed_ms * 3.6, 1),
+
+                      "wind_direction_deg":
+                          round(direction),
+
+                      "pressure_msl_hpa":
+                          round(pressure_pa / 100.0, 1),
+
+                      "precipitation_mm":
+                          round(max(precip_m * 1000.0, 0.0), 2),
+
+                      "cloud_cover_percent":
+                          round(
+                              max(
+                                  0.0,
+                                  min(
+                                      100.0,
+                                      cloud_fraction * 100.0
+                                  )
+                              ),
+                              1
+                          )
+                  })
+
+          generated_at = datetime.now(
+              timezone.utc
+          ).isoformat()
+
+          tile_names = []
+          total_points = 0
+
+          for tile, point_map in tiles.items():
+              tile_names.append(tile)
+
+              points = list(point_map.values())
+              total_points += len(points)
+
+              payload = {
+                  "status": "ok",
+                  "source": "ECMWF Open Data",
+                  "model": "IFS",
+                  "model_run": RUN_ID,
+                  "tile": tile,
+
+                  "forecast_hours": 24,
+                  "forecast_interval_hours": 3,
+
+                  "generated_at": generated_at,
+
+                  "attribution":
+                      "ECMWF Open Data",
+
+                  "points": points
+              }
+
+              with open(
+                  f"ecmwf-tiles/{tile}.json",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(
+                      payload,
+                      f,
+                      separators=(",", ":"),
+                      ensure_ascii=False
+                  )
+
+          index = {
+              "status": "ok",
+              "source": "ECMWF Open Data",
+              "model": "IFS",
+              "model_run": RUN_ID,
+              "generated_at": generated_at,
+              "tile_count": len(tile_names),
+              "total_points": total_points,
+              "forecast_hours": 24,
+              "forecast_interval_hours": 3,
+              "attribution": "ECMWF Open Data",
+              "tiles": sorted(tile_names)
+          }
+
+          with open(
+              "ecmwf-ifs-index.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  index,
+                  f,
+                  separators=(",", ":"),
+                  ensure_ascii=False
+              )
+
+          with open(
+              "ecmwf-ifs-run.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(RUN_ID)
+
+          print("ECMWF Lauf:", RUN_ID)
+          print("Kacheln:", len(tile_names))
+          print("Punkte:", total_points)
+          PY
+
+      - name: ECMWF Kachelarchiv erstellen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          tar -czf ecmwf-ifs-tiles.tar.gz ecmwf-tiles
+          ls -lh ecmwf-ifs-tiles.tar.gz
+
+      - name: ECMWF IFS zu STRATO übertragen
+        if: steps.changed.outputs.new_data == 'true'
+        env:
+          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mkdir -p Orend/paraweather-data"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            ecmwf-ifs-tiles.tar.gz \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-tiles.tar.gz"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            ecmwf-ifs-index.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-index.json"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            ecmwf-ifs-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-run.txt"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            '
+            cd Orend/paraweather-data &&
+            rm -rf ecmwf-ifs-tiles-new &&
+            mkdir ecmwf-ifs-tiles-new &&
+            tar -xzf ecmwf-ifs-tiles.tar.gz \
+              -C ecmwf-ifs-tiles-new \
+              --strip-components=1 &&
+            rm -rf ecmwf-ifs-tiles-old &&
+            if [ -d ecmwf-ifs-tiles ]; then
+              mv ecmwf-ifs-tiles ecmwf-ifs-tiles-old
+            fi &&
+            mv ecmwf-ifs-tiles-new ecmwf-ifs-tiles &&
+            rm -rf ecmwf-ifs-tiles-old &&
+            rm -f ecmwf-ifs-tiles.tar.gz
+            '
+
+      - name: Kein neuer ECMWF Lauf
+        if: steps.changed.outputs.new_data == 'false'
+        run: |
+          echo "ECMWF IFS ist bereits aktuell."
+          echo "Keine Daten neu verarbeitet."
