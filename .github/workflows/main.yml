@@ -24,7 +24,6 @@ jobs:
           import os
 
           now = datetime.now(timezone.utc)
-
           base_hour = (now.hour // 3) * 3
           base = now.replace(
               hour=base_hour,
@@ -33,52 +32,43 @@ jobs:
               microsecond=0
           )
 
+          fields = [
+              "u_10m",
+              "v_10m",
+              "t_2m",
+              "vmax_10m",
+              "tot_prec",
+              "clct",
+              "pmsl"
+          ]
+
           found = None
 
           for back in range(0, 24, 3):
               run = base - timedelta(hours=back)
-
               date = run.strftime("%Y%m%d")
               hour = run.strftime("%H")
 
-              base_url = (
+              root = (
                   f"https://opendata.dwd.de/weather/nwp/"
                   f"icon-d2/grib/{hour}"
               )
 
-              checks = [
-                  ("u_10m", "u_10m"),
-                  ("v_10m", "v_10m"),
-                  ("t_2m", "t_2m"),
-                  ("vmax_10m", "vmax_10m"),
-                  ("tot_prec", "tot_prec"),
-                  ("clct", "clct"),
-                  ("pmsl", "pmsl"),
-              ]
-
               complete = True
 
-              for folder, field in checks:
+              for field in fields:
                   url = (
-                      f"{base_url}/{folder}/"
+                      f"{root}/{field}/"
                       f"icon-d2_germany_regular-lat-lon_single-level_"
                       f"{date}{hour}_024_2d_{field}.grib2.bz2"
                   )
 
                   try:
-                      request = urllib.request.Request(
-                          url,
-                          method="HEAD"
-                      )
-
-                      with urllib.request.urlopen(
-                          request,
-                          timeout=15
-                      ) as response:
+                      req = urllib.request.Request(url, method="HEAD")
+                      with urllib.request.urlopen(req, timeout=15) as response:
                           if response.status != 200:
                               complete = False
                               break
-
                   except Exception:
                       complete = False
                       break
@@ -97,10 +87,7 @@ jobs:
 
           print("Gefundener ICON-D2 Lauf:", run_id)
 
-          with open(
-              os.environ["GITHUB_OUTPUT"],
-              "a"
-          ) as output:
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"date={date}\n")
               output.write(f"hour={hour}\n")
               output.write(f"run_id={run_id}\n")
@@ -118,7 +105,7 @@ jobs:
           )
 
           echo "DWD Lauf: $CURRENT_RUN"
-          echo "STRATO Kachel-Lauf: $REMOTE_RUN"
+          echo "STRATO Lauf: $REMOTE_RUN"
 
           if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
             echo "Kein neuer Modelllauf."
@@ -133,29 +120,27 @@ jobs:
         run: |
           HOUR="${{ steps.detect.outputs.hour }}"
           RUN="${{ steps.detect.outputs.run_id }}"
-
           BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/${HOUR}"
 
           mkdir -p grib
+
+          FIELDS="u_10m v_10m t_2m vmax_10m tot_prec clct pmsl"
 
           for STEP in $(seq 0 24); do
             FSTEP=$(printf "%03d" "$STEP")
 
             echo "Lade ICON-D2 ${RUN} +${FSTEP}h"
 
-            for FIELD in u_10m v_10m t_2m vmax_10m tot_prec clct pmsl; do
-
+            for FIELD in $FIELDS; do
               curl -fL \
                 "$BASE/$FIELD/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_${FIELD}.grib2.bz2" \
                 -o "grib/${FIELD}_${FSTEP}.grib2.bz2"
 
-              bunzip2 \
-                "grib/${FIELD}_${FSTEP}.grib2.bz2"
-
+              bunzip2 "grib/${FIELD}_${FSTEP}.grib2.bz2"
             done
           done
 
-      - name: ICON-D2 Kacheln 0-24h erzeugen
+      - name: ICON-D2 Kacheln erzeugen
         if: steps.changed.outputs.new_data == 'true'
         run: |
           python3 <<'PY'
@@ -170,14 +155,9 @@ jobs:
           run_time = datetime.strptime(
               RUN_ID,
               "%Y%m%d%H"
-          ).replace(
-              tzinfo=timezone.utc
-          )
+          ).replace(tzinfo=timezone.utc)
 
-          os.makedirs(
-              "tiles",
-              exist_ok=True
-          )
+          os.makedirs("tiles", exist_ok=True)
 
           def read_values(path):
               output = subprocess.check_output(
@@ -201,13 +181,7 @@ jobs:
                   except ValueError:
                       continue
 
-                  rows.append(
-                      (
-                          lat,
-                          lon,
-                          value
-                      )
-                  )
+                  rows.append((lat, lon, value))
 
               if not rows:
                   raise RuntimeError(
@@ -220,65 +194,31 @@ jobs:
               lat_floor = math.floor(lat)
               lon_floor = math.floor(lon)
 
-              lat_prefix = (
-                  "N"
-                  if lat_floor >= 0
-                  else "S"
-              )
-
-              lon_prefix = (
-                  "E"
-                  if lon_floor >= 0
-                  else "W"
-              )
+              lat_prefix = "N" if lat_floor >= 0 else "S"
+              lon_prefix = "E" if lon_floor >= 0 else "W"
 
               return (
-                  f"{lat_prefix}"
-                  f"{abs(lat_floor):02d}_"
-                  f"{lon_prefix}"
-                  f"{abs(lon_floor):03d}"
+                  f"{lat_prefix}{abs(lat_floor):02d}_"
+                  f"{lon_prefix}{abs(lon_floor):03d}"
               )
 
           sampling_step = 10
           tiles = {}
 
-          for forecast_hour in range(0, 25):
-
+          for forecast_hour in range(25):
               fstep = f"{forecast_hour:03d}"
 
-              print(
-                  f"Verarbeite Forecast +{fstep}h"
-              )
+              print("Verarbeite +", fstep, "h")
 
-              u_rows = read_values(
-                  f"grib/u_10m_{fstep}.grib2"
-              )
+              u_rows = read_values(f"grib/u_10m_{fstep}.grib2")
+              v_rows = read_values(f"grib/v_10m_{fstep}.grib2")
+              t_rows = read_values(f"grib/t_2m_{fstep}.grib2")
+              gust_rows = read_values(f"grib/vmax_10m_{fstep}.grib2")
+              precip_rows = read_values(f"grib/tot_prec_{fstep}.grib2")
+              cloud_rows = read_values(f"grib/clct_{fstep}.grib2")
+              pressure_rows = read_values(f"grib/pmsl_{fstep}.grib2")
 
-              v_rows = read_values(
-                  f"grib/v_10m_{fstep}.grib2"
-              )
-
-              t_rows = read_values(
-                  f"grib/t_2m_{fstep}.grib2"
-              )
-
-              gust_rows = read_values(
-                  f"grib/vmax_10m_{fstep}.grib2"
-              )
-
-              precip_rows = read_values(
-                  f"grib/tot_prec_{fstep}.grib2"
-              )
-
-              cloud_rows = read_values(
-                  f"grib/clct_{fstep}.grib2"
-              )
-
-              pressure_rows = read_values(
-                  f"grib/pmsl_{fstep}.grib2"
-              )
-
-              sizes = {
+              lengths = {
                   len(u_rows),
                   len(v_rows),
                   len(t_rows),
@@ -288,16 +228,14 @@ jobs:
                   len(pressure_rows)
               }
 
-              if len(sizes) != 1:
+              if len(lengths) != 1:
                   raise RuntimeError(
                       f"Rastergrößen bei +{fstep}h stimmen nicht überein"
                   )
 
               valid_time = (
-                  run_time
-                  + timedelta(
-                      hours=forecast_hour
-                  )
+                  run_time +
+                  timedelta(hours=forecast_hour)
               ).isoformat()
 
               for i in range(
@@ -305,116 +243,63 @@ jobs:
                   len(u_rows),
                   sampling_step
               ):
-
                   lat, lon, u = u_rows[i]
                   _, _, v = v_rows[i]
                   _, _, temp_k = t_rows[i]
                   _, _, gust_ms = gust_rows[i]
-                  _, _, precip_mm = precip_rows[i]
-                  _, _, cloud_percent = cloud_rows[i]
+                  _, _, precip = precip_rows[i]
+                  _, _, cloud = cloud_rows[i]
                   _, _, pressure_pa = pressure_rows[i]
 
-                  tile = tile_name(
-                      lat,
-                      lon
-                  )
+                  tile = tile_name(lat, lon)
 
                   if tile not in tiles:
-                      tiles[tile] = {
-                          "points": {},
-                          "bounds": {
-                              "lat":
-                                  math.floor(lat),
-                              "lon":
-                                  math.floor(lon)
-                          }
+                      tiles[tile] = {}
+
+                  key = f"{round(lat,4)},{round(lon,4)}"
+
+                  if key not in tiles[tile]:
+                      tiles[tile][key] = {
+                          "lat": round(lat, 4),
+                          "lon": round(lon, 4),
+                          "forecast": []
                       }
 
-                  point_key = (
-                      f"{round(lat,4)},"
-                      f"{round(lon,4)}"
-                  )
-
-                  if (
-                      point_key
-                      not in
-                      tiles[tile]["points"]
-                  ):
-                      tiles[tile]["points"][
-                          point_key
-                      ] = {
-                          "lat":
-                              round(lat, 4),
-
-                          "lon":
-                              round(lon, 4),
-
-                          "forecast":
-                              []
-                      }
-
-                  speed_ms = math.sqrt(
-                      u * u
-                      + v * v
+                  wind_ms = math.sqrt(
+                      u * u +
+                      v * v
                   )
 
                   direction = (
                       math.degrees(
-                          math.atan2(
-                              -u,
-                              -v
-                          )
-                      )
-                      + 360
+                          math.atan2(-u, -v)
+                      ) + 360
                   ) % 360
 
-                  forecast = {
-                      "hour":
-                          forecast_hour,
-
-                      "valid_time":
-                          valid_time,
+                  tiles[tile][key]["forecast"].append({
+                      "hour": forecast_hour,
+                      "valid_time": valid_time,
 
                       "temperature_c":
-                          round(
-                              temp_k - 273.15,
-                              1
-                          ),
+                          round(temp_k - 273.15, 1),
 
                       "wind_speed_kmh":
-                          round(
-                              speed_ms * 3.6,
-                              1
-                          ),
+                          round(wind_ms * 3.6, 1),
 
                       "wind_direction_deg":
-                          round(
-                              direction
-                          ),
+                          round(direction),
 
                       "wind_gust_kmh":
-                          round(
-                              gust_ms * 3.6,
-                              1
-                          ),
+                          round(gust_ms * 3.6, 1),
 
                       "precipitation_mm":
-                          round(
-                              max(
-                                  precip_mm,
-                                  0.0
-                              ),
-                              2
-                          ),
+                          round(max(precip, 0.0), 2),
 
                       "cloud_cover_percent":
                           round(
                               max(
                                   0.0,
-                                  min(
-                                      100.0,
-                                      cloud_percent
-                                  )
+                                  min(100.0, cloud)
                               ),
                               1
                           ),
@@ -424,58 +309,33 @@ jobs:
                               pressure_pa / 100.0,
                               1
                           )
-                  }
-
-                  tiles[tile]["points"][
-                      point_key
-                  ]["forecast"].append(
-                      forecast
-                  )
+                  })
 
           generated_at = datetime.now(
               timezone.utc
           ).isoformat()
 
+          index_tiles = []
           total_points = 0
 
-          for tile_name_value, tile_data in tiles.items():
+          for tile, point_map in tiles.items():
 
               points = list(
-                  tile_data[
-                      "points"
-                  ].values()
+                  point_map.values()
               )
 
-              total_points += len(
-                  points
-              )
+              total_points += len(points)
+              index_tiles.append(tile)
 
               output = {
-                  "status":
-                      "ok",
+                  "status": "ok",
+                  "source": "DWD Open Data",
+                  "model": "ICON-D2",
+                  "model_run": RUN_ID,
+                  "tile": tile,
 
-                  "source":
-                      "DWD Open Data",
-
-                  "model":
-                      "ICON-D2",
-
-                  "model_run":
-                      RUN_ID,
-
-                  "tile":
-                      tile_name_value,
-
-                  "bounds":
-                      tile_data[
-                          "bounds"
-                      ],
-
-                  "forecast_hours":
-                      24,
-
-                  "forecast_interval_hours":
-                      1,
+                  "forecast_hours": 24,
+                  "forecast_interval_hours": 1,
 
                   "generated_at":
                       generated_at,
@@ -500,13 +360,8 @@ jobs:
                       points
               }
 
-              path = os.path.join(
-                  "tiles",
-                  f"{tile_name_value}.json"
-              )
-
               with open(
-                  path,
+                  f"tiles/{tile}.json",
                   "w",
                   encoding="utf-8"
               ) as f:
@@ -518,56 +373,29 @@ jobs:
                   )
 
           index = {
-              "status":
-                  "ok",
-
-              "source":
-                  "DWD Open Data",
-
-              "model":
-                  "ICON-D2",
-
-              "model_run":
-                  RUN_ID,
+              "status": "ok",
+              "source": "DWD Open Data",
+              "model": "ICON-D2",
+              "model_run": RUN_ID,
 
               "generated_at":
                   generated_at,
 
-              "tile_size_degrees":
-                  1,
+              "tile_size_degrees": 1,
+              "tile_count": len(index_tiles),
+              "total_points": total_points,
 
-              "tile_count":
-                  len(tiles),
-
-              "total_points":
-                  total_points,
-
-              "forecast_hours":
-                  24,
-
-              "forecast_interval_hours":
-                  1,
+              "forecast_hours": 24,
+              "forecast_interval_hours": 1,
 
               "sampling_step":
                   sampling_step,
-
-              "parameters": [
-                  "temperature_c",
-                  "wind_speed_kmh",
-                  "wind_direction_deg",
-                  "wind_gust_kmh",
-                  "precipitation_mm",
-                  "cloud_cover_percent",
-                  "pressure_msl_hpa"
-              ],
 
               "attribution":
                   "Deutscher Wetterdienst (DWD)",
 
               "tiles":
-                  sorted(
-                      tiles.keys()
-                  )
+                  sorted(index_tiles)
           }
 
           with open(
@@ -587,36 +415,19 @@ jobs:
               "w",
               encoding="utf-8"
           ) as f:
-              f.write(
-                  RUN_ID
-              )
+              f.write(RUN_ID)
 
-          print(
-              "Modelllauf:",
-              RUN_ID
-          )
-
-          print(
-              "Kacheln:",
-              len(tiles)
-          )
-
-          print(
-              "Rasterpunkte:",
-              total_points
-          )
+          print("Modelllauf:", RUN_ID)
+          print("Kacheln:", len(index_tiles))
+          print("Rasterpunkte:", total_points)
           PY
 
       - name: Kachelarchiv erstellen
         if: steps.changed.outputs.new_data == 'true'
         run: |
-          tar -czf \
-            icon-d2-tiles.tar.gz \
-            tiles
+          tar -czf icon-d2-tiles.tar.gz tiles
 
-          ls -lh \
-            icon-d2-tiles.tar.gz
-
+          ls -lh icon-d2-tiles.tar.gz
           echo -n "Kachelanzahl: "
           ls tiles | wc -l
 
@@ -653,7 +464,9 @@ jobs:
             cd Orend/paraweather-data &&
             rm -rf icon-d2-tiles-new &&
             mkdir icon-d2-tiles-new &&
-            tar -xzf icon-d2-tiles.tar.gz -C icon-d2-tiles-new --strip-components=1 &&
+            tar -xzf icon-d2-tiles.tar.gz \
+              -C icon-d2-tiles-new \
+              --strip-components=1 &&
             rm -rf icon-d2-tiles-old &&
             if [ -d icon-d2-tiles ]; then
               mv icon-d2-tiles icon-d2-tiles-old
