@@ -1,0 +1,25 @@
+name: ParaWeather STRATO Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Testdatei erstellen
+        run: |
+          echo '{"status":"ok","service":"ParaWeather"}' > test.json
+
+      - name: Auf STRATO übertragen
+        env:
+          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            -P 22 \
+            test.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:cgi-bin/test.json"
