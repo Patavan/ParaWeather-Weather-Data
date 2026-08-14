@@ -1,1 +1,97 @@
+name: ParaWeather AROME Pipeline
 
+on:
+  workflow_dispatch:
+
+jobs:
+  arome:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: AROME 0.01 Capabilities laden
+        env:
+          METEOFRANCE_ACCESS_TOKEN: ${{ secrets.METEOFRANCE_ACCESS_TOKEN }}
+        run: |
+          curl -fL \
+            "https://public-api.meteofrance.fr/public/arome/1.0/wcs/MF-NWP-HIGHRES-AROME-001-FRANCE-WCS/GetCapabilities?service=WCS&version=2.0.1&language=eng" \
+            -H "Authorization: Bearer ${METEOFRANCE_ACCESS_TOKEN}" \
+            -H "accept: */*" \
+            -o arome-capabilities.xml
+
+          echo "AROME Capabilities geladen."
+          ls -lh arome-capabilities.xml
+
+      - name: AROME Coverages auslesen
+        run: |
+          python3 <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+
+          tree = ET.parse("arome-capabilities.xml")
+          root = tree.getroot()
+
+          coverages = []
+
+          for element in root.iter():
+              tag = element.tag.split("}")[-1]
+
+              if tag in ("CoverageId", "Identifier"):
+                  if element.text:
+                      value = element.text.strip()
+
+                      if value and value not in coverages:
+                          coverages.append(value)
+
+          result = {
+              "status": "ok",
+              "source": "Météo-France",
+              "model": "AROME",
+              "resolution_deg": 0.01,
+              "service": "WCS 2.0.1",
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "coverage_count": len(coverages),
+              "coverages": coverages
+          }
+
+          with open(
+              "arome-capabilities.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print(
+              "Gefundene AROME Coverages:",
+              len(coverages)
+          )
+
+          for item in coverages:
+              print(item)
+          PY
+
+      - name: AROME Informationen zu STRATO übertragen
+        env:
+          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mkdir -p Orend/paraweather-data"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            arome-capabilities.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-capabilities.json"
