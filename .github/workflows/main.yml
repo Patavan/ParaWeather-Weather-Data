@@ -25,7 +25,6 @@ jobs:
 
           now = datetime.now(timezone.utc)
 
-          # Auf letzten 3-Stunden-Modelllauf abrunden
           base_hour = (now.hour // 3) * 3
           base = now.replace(
               hour=base_hour,
@@ -36,8 +35,6 @@ jobs:
 
           found = None
 
-          # Mehrere vorherige Läufe prüfen,
-          # falls der neueste noch nicht vollständig veröffentlicht ist.
           for back in range(0, 24, 3):
               run = base - timedelta(hours=back)
 
@@ -49,18 +46,21 @@ jobs:
                   f"icon-d2/grib/{hour}"
               )
 
+              # Wir prüfen Forecast 024 gleich mit.
+              # Damit wird nur ein Lauf verwendet,
+              # dessen 24-h-Daten bereits verfügbar sind.
               files = [
                   f"{base_url}/u_10m/"
                   f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_000_2d_u_10m.grib2.bz2",
+                  f"{date}{hour}_024_2d_u_10m.grib2.bz2",
 
                   f"{base_url}/v_10m/"
                   f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_000_2d_v_10m.grib2.bz2",
+                  f"{date}{hour}_024_2d_v_10m.grib2.bz2",
 
                   f"{base_url}/t_2m/"
                   f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_000_2d_t_2m.grib2.bz2"
+                  f"{date}{hour}_024_2d_t_2m.grib2.bz2"
               ]
 
               ok = True
@@ -90,7 +90,7 @@ jobs:
 
           if found is None:
               raise RuntimeError(
-                  "Kein vollständiger ICON-D2 Lauf gefunden"
+                  "Kein vollständiger ICON-D2 24h-Lauf gefunden"
               )
 
           date, hour = found
@@ -114,12 +114,12 @@ jobs:
 
           REMOTE_RUN=$(
             curl -fsS \
-            "https://www.orend.org/paraweather-data/icon-d2-run.txt" \
+            "https://www.orend.org/paraweather-data/icon-d2-24h-run.txt" \
             2>/dev/null || true
           )
 
           echo "DWD Lauf: $CURRENT_RUN"
-          echo "STRATO Lauf: $REMOTE_RUN"
+          echo "STRATO 24h Lauf: $REMOTE_RUN"
 
           if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
             echo "Kein neuer Modelllauf."
@@ -129,44 +129,53 @@ jobs:
             echo "new_data=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: ICON-D2 Daten laden
+      - name: ICON-D2 Daten 0-24h laden
         if: steps.changed.outputs.new_data == 'true'
         run: |
-          DATE="${{ steps.detect.outputs.date }}"
           HOUR="${{ steps.detect.outputs.hour }}"
           RUN="${{ steps.detect.outputs.run_id }}"
 
           BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/${HOUR}"
 
-          echo "Verarbeite ICON-D2 Lauf: ${RUN}"
+          mkdir -p grib
 
-          curl -fL \
-            "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_u_10m.grib2.bz2" \
-            -o u.grib2.bz2
+          for STEP in $(seq 0 24); do
+            FSTEP=$(printf "%03d" "$STEP")
 
-          curl -fL \
-            "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_v_10m.grib2.bz2" \
-            -o v.grib2.bz2
+            echo "Lade ICON-D2 ${RUN} +${FSTEP}h"
 
-          curl -fL \
-            "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_t_2m.grib2.bz2" \
-            -o t.grib2.bz2
+            curl -fL \
+              "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_u_10m.grib2.bz2" \
+              -o "grib/u_${FSTEP}.grib2.bz2"
 
-          bunzip2 u.grib2.bz2
-          bunzip2 v.grib2.bz2
-          bunzip2 t.grib2.bz2
+            curl -fL \
+              "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_v_10m.grib2.bz2" \
+              -o "grib/v_${FSTEP}.grib2.bz2"
 
-      - name: ICON-D2 Raster auslesen
+            curl -fL \
+              "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_t_2m.grib2.bz2" \
+              -o "grib/t_${FSTEP}.grib2.bz2"
+
+            bunzip2 "grib/u_${FSTEP}.grib2.bz2"
+            bunzip2 "grib/v_${FSTEP}.grib2.bz2"
+            bunzip2 "grib/t_${FSTEP}.grib2.bz2"
+          done
+
+      - name: ICON-D2 0-24h Raster erzeugen
         if: steps.changed.outputs.new_data == 'true'
         run: |
           python3 <<'PY'
           import subprocess
           import json
           import math
-          from datetime import datetime, timezone
-          import os
+          from datetime import datetime, timezone, timedelta
 
           RUN_ID = "${{ steps.detect.outputs.run_id }}"
+
+          run_time = datetime.strptime(
+              RUN_ID,
+              "%Y%m%d%H"
+          ).replace(tzinfo=timezone.utc)
 
           def read_values(path):
               output = subprocess.check_output(
@@ -190,13 +199,7 @@ jobs:
                   except ValueError:
                       continue
 
-                  rows.append(
-                      (
-                          lat,
-                          lon,
-                          value
-                      )
-                  )
+                  rows.append((lat, lon, value))
 
               if not rows:
                   raise RuntimeError(
@@ -205,89 +208,126 @@ jobs:
 
               return rows
 
-          u_rows = read_values("u.grib2")
-          v_rows = read_values("v.grib2")
-          t_rows = read_values("t.grib2")
+          sampling_step = 10
 
-          if not (
-              len(u_rows) ==
-              len(v_rows) ==
-              len(t_rows)
-          ):
-              raise RuntimeError(
-                  "ICON-D2 Rastergrößen stimmen nicht überein"
+          points = None
+
+          for forecast_hour in range(0, 25):
+              fstep = f"{forecast_hour:03d}"
+
+              print(
+                  f"Verarbeite Forecast +{fstep}h"
               )
 
-          points = []
-
-          # Vorerst datensparsam:
-          # jeder 10. Rasterpunkt.
-          step = 10
-
-          for i in range(
-              0,
-              len(u_rows),
-              step
-          ):
-              lat, lon, u = u_rows[i]
-              _, _, v = v_rows[i]
-              _, _, temp_k = t_rows[i]
-
-              speed_ms = math.sqrt(
-                  u * u +
-                  v * v
+              u_rows = read_values(
+                  f"grib/u_{fstep}.grib2"
               )
 
-              direction = (
-                  math.degrees(
-                      math.atan2(
-                          -u,
-                          -v
+              v_rows = read_values(
+                  f"grib/v_{fstep}.grib2"
+              )
+
+              t_rows = read_values(
+                  f"grib/t_{fstep}.grib2"
+              )
+
+              if not (
+                  len(u_rows) ==
+                  len(v_rows) ==
+                  len(t_rows)
+              ):
+                  raise RuntimeError(
+                      f"Rastergrößen bei +{fstep}h stimmen nicht überein"
+                  )
+
+              valid_time = (
+                  run_time +
+                  timedelta(hours=forecast_hour)
+              ).isoformat()
+
+              if points is None:
+                  points = []
+
+                  for i in range(
+                      0,
+                      len(u_rows),
+                      sampling_step
+                  ):
+                      lat, lon, _ = u_rows[i]
+
+                      points.append({
+                          "lat": round(lat, 4),
+                          "lon": round(lon, 4),
+                          "forecast": []
+                      })
+
+              point_index = 0
+
+              for i in range(
+                  0,
+                  len(u_rows),
+                  sampling_step
+              ):
+                  lat, lon, u = u_rows[i]
+                  _, _, v = v_rows[i]
+                  _, _, temp_k = t_rows[i]
+
+                  speed_ms = math.sqrt(
+                      u * u +
+                      v * v
+                  )
+
+                  direction = (
+                      math.degrees(
+                          math.atan2(
+                              -u,
+                              -v
+                          )
                       )
-                  )
-                  + 360
-              ) % 360
+                      + 360
+                  ) % 360
 
-              points.append({
-                  "lat": round(lat, 4),
-                  "lon": round(lon, 4),
-                  "temperature_c": round(
-                      temp_k - 273.15,
-                      1
-                  ),
-                  "wind_speed_kmh": round(
-                      speed_ms * 3.6,
-                      1
-                  ),
-                  "wind_direction_deg": round(
-                      direction
-                  )
-              })
+                  points[
+                      point_index
+                  ]["forecast"].append({
+                      "hour": forecast_hour,
+                      "valid_time": valid_time,
+                      "temperature_c": round(
+                          temp_k - 273.15,
+                          1
+                      ),
+                      "wind_speed_kmh": round(
+                          speed_ms * 3.6,
+                          1
+                      ),
+                      "wind_direction_deg": round(
+                          direction
+                      )
+                  })
+
+                  point_index += 1
 
           result = {
               "status": "ok",
               "source": "DWD Open Data",
               "model": "ICON-D2",
               "model_run": RUN_ID,
-              "generated_at":
-                  datetime.now(
-                      timezone.utc
-                  ).isoformat(),
+              "forecast_hours": 24,
+              "forecast_interval_hours": 1,
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
               "attribution":
                   "Deutscher Wetterdienst (DWD)",
               "sampling": {
-                  "original_points":
-                      len(u_rows),
-                  "step":
-                      step,
-                  "exported_points":
-                      len(points)
+                  "step": sampling_step,
+                  "exported_points": len(points)
               },
               "points": points
           }
 
           with open(
-              "icon-d2-grid.json",
+              "icon-d2-24h.json",
               "w",
               encoding="utf-8"
           ) as f:
@@ -299,29 +339,18 @@ jobs:
               )
 
           with open(
-              "icon-d2-run.txt",
+              "icon-d2-24h-run.txt",
               "w",
               encoding="utf-8"
           ) as f:
               f.write(RUN_ID)
 
-          print(
-              "Modelllauf:",
-              RUN_ID
-          )
-
-          print(
-              "Original Rasterpunkte:",
-              len(u_rows)
-          )
-
-          print(
-              "Exportierte Rasterpunkte:",
-              len(points)
-          )
+          print("Modelllauf:", RUN_ID)
+          print("Rasterpunkte:", len(points))
+          print("Zeitschritte je Punkt: 25")
           PY
 
-      - name: ICON-D2 zu STRATO übertragen
+      - name: ICON-D2 24h zu STRATO übertragen
         if: steps.changed.outputs.new_data == 'true'
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
@@ -334,18 +363,18 @@ jobs:
 
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
-            icon-d2-grid.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-grid.json"
+            icon-d2-24h.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-24h.json"
 
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
-            icon-d2-run.txt \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-run.txt"
+            icon-d2-24h-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-24h-run.txt"
 
       - name: Kein neuer ICON-D2 Lauf
         if: steps.changed.outputs.new_data == 'false'
         run: |
-          echo "ICON-D2 ist bereits aktuell."
+          echo "ICON-D2 24h ist bereits aktuell."
           echo "Keine GRIB-Dateien geladen."
           echo "Keine Daten neu verarbeitet."
           echo "Kein STRATO-Upload notwendig."
