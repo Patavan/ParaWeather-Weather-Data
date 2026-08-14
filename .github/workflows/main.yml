@@ -1,4 +1,4 @@
-name: ParaWeather ICON-D2 Test
+name: ParaWeather ICON-D2 Pipeline
 
 on:
   workflow_dispatch:
@@ -56,6 +56,7 @@ jobs:
 
               for line in text.splitlines():
                   parts = line.split()
+
                   if len(parts) < 3:
                       continue
 
@@ -66,7 +67,7 @@ jobs:
                   except ValueError:
                       continue
 
-                  d = (lat-LAT)**2 + (lon-LON)**2
+                  d = (lat - LAT) ** 2 + (lon - LON) ** 2
 
                   if best is None or d < best[0]:
                       best = (d, lat, lon, value)
@@ -80,44 +81,253 @@ jobs:
           _, _, _, v = nearest("v.grib2")
           _, _, _, temp_k = nearest("t.grib2")
 
-          speed_ms = math.sqrt(u*u + v*v)
+          speed_ms = math.sqrt(u * u + v * v)
           speed_kmh = speed_ms * 3.6
 
-          direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+          direction = (
+              math.degrees(
+                  math.atan2(-u, -v)
+              ) + 360
+          ) % 360
 
           result = {
               "status": "ok",
               "source": "DWD Open Data",
               "model": "ICON-D2",
+
               "location": {
                   "name": "Bingen am Rhein",
                   "latitude": LAT,
                   "longitude": LON
               },
+
               "grid": {
                   "latitude": glat,
                   "longitude": glon
               },
+
               "weather": {
                   "temperature_c": round(temp_k - 273.15, 1),
                   "wind_speed_ms": round(speed_ms, 1),
                   "wind_speed_kmh": round(speed_kmh, 1),
                   "wind_direction_deg": round(direction)
               },
-              "generated_at": datetime.now(timezone.utc).isoformat(),
-              "attribution": "Deutscher Wetterdienst (DWD)"
+
+              "generated_at":
+                  datetime.now(timezone.utc).isoformat(),
+
+              "attribution":
+                  "Deutscher Wetterdienst (DWD)"
           }
 
-          with open("icon-d2-bingen.json", "w") as f:
-              json.dump(result, f, indent=2)
+          with open(
+              "icon-d2-bingen.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
 
-          print(json.dumps(result, indent=2))
+          print(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
           PY
 
-      - name: JSON zu STRATO übertragen
+      - name: Kompaktes ICON-D2 Raster erzeugen
+        run: |
+          python3 <<'PY'
+          import subprocess
+          import json
+          import math
+          from datetime import datetime, timezone
+
+          def read_grid(path):
+              text = subprocess.check_output(
+                  [
+                      "grib_get_data",
+                      "-p",
+                      "latitude,longitude,value",
+                      path
+                  ],
+                  text=True
+              )
+
+              rows = []
+
+              for line in text.splitlines():
+                  parts = line.split()
+
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      lat = float(parts[0])
+                      lon = float(parts[1])
+                      value = float(parts[2])
+                  except ValueError:
+                      continue
+
+                  rows.append(
+                      (
+                          lat,
+                          lon,
+                          value
+                      )
+                  )
+
+              return rows
+
+          u_rows = read_grid("u.grib2")
+          v_rows = read_grid("v.grib2")
+          t_rows = read_grid("t.grib2")
+
+          if not (
+              len(u_rows) ==
+              len(v_rows) ==
+              len(t_rows)
+          ):
+              raise RuntimeError(
+                  "ICON-D2 Rastergrößen stimmen nicht überein"
+              )
+
+          points = []
+
+          #
+          # Datensparsame Teststufe:
+          #
+          # Vorerst wird nur jeder 10. Rasterpunkt
+          # exportiert.
+          #
+          # Später können wir den Wert anpassen.
+          #
+          step = 10
+
+          for i in range(
+              0,
+              len(u_rows),
+              step
+          ):
+
+              lat, lon, u = u_rows[i]
+              _, _, v = v_rows[i]
+              _, _, temp_k = t_rows[i]
+
+              speed_ms = math.sqrt(
+                  u * u +
+                  v * v
+              )
+
+              speed_kmh = (
+                  speed_ms *
+                  3.6
+              )
+
+              direction = (
+                  math.degrees(
+                      math.atan2(
+                          -u,
+                          -v
+                      )
+                  )
+                  + 360
+              ) % 360
+
+              points.append(
+                  {
+                      "lat":
+                          round(lat, 4),
+
+                      "lon":
+                          round(lon, 4),
+
+                      "temperature_c":
+                          round(
+                              temp_k - 273.15,
+                              1
+                          ),
+
+                      "wind_speed_kmh":
+                          round(
+                              speed_kmh,
+                              1
+                          ),
+
+                      "wind_direction_deg":
+                          round(direction)
+                  }
+              )
+
+          result = {
+              "status":
+                  "ok",
+
+              "source":
+                  "DWD Open Data",
+
+              "model":
+                  "ICON-D2",
+
+              "generated_at":
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+
+              "attribution":
+                  "Deutscher Wetterdienst (DWD)",
+
+              "sampling": {
+                  "original_points":
+                      len(u_rows),
+
+                  "step":
+                      step,
+
+                  "exported_points":
+                      len(points)
+              },
+
+              "points":
+                  points
+          }
+
+          with open(
+              "icon-d2-grid.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              json.dump(
+                  result,
+                  f,
+                  separators=(",", ":"),
+                  ensure_ascii=False
+              )
+
+          print(
+              "Original Rasterpunkte:",
+              len(u_rows)
+          )
+
+          print(
+              "Exportierte Rasterpunkte:",
+              len(points)
+          )
+          PY
+
+      - name: Dateien zu STRATO übertragen
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+
         run: |
+
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
@@ -127,3 +337,8 @@ jobs:
             -o StrictHostKeyChecking=no \
             icon-d2-bingen.json \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-bingen.json"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            icon-d2-grid.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-grid.json"
