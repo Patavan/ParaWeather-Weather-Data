@@ -22,4 +22,4 @@ jobs:
             -o StrictHostKeyChecking=no \
             -P 22 \
             test.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:cgi-bin/test.json"
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/test.json"
