@@ -46,23 +46,25 @@ jobs:
                   f"icon-d2/grib/{hour}"
               )
 
-              files = [
-                  f"{base_url}/u_10m/"
-                  f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_024_2d_u_10m.grib2.bz2",
-
-                  f"{base_url}/v_10m/"
-                  f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_024_2d_v_10m.grib2.bz2",
-
-                  f"{base_url}/t_2m/"
-                  f"icon-d2_germany_regular-lat-lon_single-level_"
-                  f"{date}{hour}_024_2d_t_2m.grib2.bz2"
+              checks = [
+                  ("u_10m", "u_10m"),
+                  ("v_10m", "v_10m"),
+                  ("t_2m", "t_2m"),
+                  ("vmax_10m", "vmax_10m"),
+                  ("tot_prec", "tot_prec"),
+                  ("clct", "clct"),
+                  ("pmsl", "pmsl"),
               ]
 
               complete = True
 
-              for url in files:
+              for folder, field in checks:
+                  url = (
+                      f"{base_url}/{folder}/"
+                      f"icon-d2_germany_regular-lat-lon_single-level_"
+                      f"{date}{hour}_024_2d_{field}.grib2.bz2"
+                  )
+
                   try:
                       request = urllib.request.Request(
                           url,
@@ -141,21 +143,16 @@ jobs:
 
             echo "Lade ICON-D2 ${RUN} +${FSTEP}h"
 
-            curl -fL \
-              "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_u_10m.grib2.bz2" \
-              -o "grib/u_${FSTEP}.grib2.bz2"
+            for FIELD in u_10m v_10m t_2m vmax_10m tot_prec clct pmsl; do
 
-            curl -fL \
-              "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_v_10m.grib2.bz2" \
-              -o "grib/v_${FSTEP}.grib2.bz2"
+              curl -fL \
+                "$BASE/$FIELD/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_${FIELD}.grib2.bz2" \
+                -o "grib/${FIELD}_${FSTEP}.grib2.bz2"
 
-            curl -fL \
-              "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_${FSTEP}_2d_t_2m.grib2.bz2" \
-              -o "grib/t_${FSTEP}.grib2.bz2"
+              bunzip2 \
+                "grib/${FIELD}_${FSTEP}.grib2.bz2"
 
-            bunzip2 "grib/u_${FSTEP}.grib2.bz2"
-            bunzip2 "grib/v_${FSTEP}.grib2.bz2"
-            bunzip2 "grib/t_${FSTEP}.grib2.bz2"
+            done
           done
 
       - name: ICON-D2 Kacheln 0-24h erzeugen
@@ -205,7 +202,11 @@ jobs:
                       continue
 
                   rows.append(
-                      (lat, lon, value)
+                      (
+                          lat,
+                          lon,
+                          value
+                      )
                   )
 
               if not rows:
@@ -238,15 +239,7 @@ jobs:
                   f"{abs(lon_floor):03d}"
               )
 
-          #
-          # Vorläufig weiter jeder 10. Modellpunkt.
-          # Dadurch bleibt das Datenvolumen klein.
-          #
-          # Später können wir die räumliche Auflösung
-          # noch erhöhen, ohne die API-Struktur zu ändern.
-          #
           sampling_step = 10
-
           tiles = {}
 
           for forecast_hour in range(0, 25):
@@ -258,22 +251,44 @@ jobs:
               )
 
               u_rows = read_values(
-                  f"grib/u_{fstep}.grib2"
+                  f"grib/u_10m_{fstep}.grib2"
               )
 
               v_rows = read_values(
-                  f"grib/v_{fstep}.grib2"
+                  f"grib/v_10m_{fstep}.grib2"
               )
 
               t_rows = read_values(
-                  f"grib/t_{fstep}.grib2"
+                  f"grib/t_2m_{fstep}.grib2"
               )
 
-              if not (
-                  len(u_rows)
-                  == len(v_rows)
-                  == len(t_rows)
-              ):
+              gust_rows = read_values(
+                  f"grib/vmax_10m_{fstep}.grib2"
+              )
+
+              precip_rows = read_values(
+                  f"grib/tot_prec_{fstep}.grib2"
+              )
+
+              cloud_rows = read_values(
+                  f"grib/clct_{fstep}.grib2"
+              )
+
+              pressure_rows = read_values(
+                  f"grib/pmsl_{fstep}.grib2"
+              )
+
+              sizes = {
+                  len(u_rows),
+                  len(v_rows),
+                  len(t_rows),
+                  len(gust_rows),
+                  len(precip_rows),
+                  len(cloud_rows),
+                  len(pressure_rows)
+              }
+
+              if len(sizes) != 1:
                   raise RuntimeError(
                       f"Rastergrößen bei +{fstep}h stimmen nicht überein"
                   )
@@ -285,8 +300,6 @@ jobs:
                   )
               ).isoformat()
 
-              point_number = 0
-
               for i in range(
                   0,
                   len(u_rows),
@@ -296,6 +309,10 @@ jobs:
                   lat, lon, u = u_rows[i]
                   _, _, v = v_rows[i]
                   _, _, temp_k = t_rows[i]
+                  _, _, gust_ms = gust_rows[i]
+                  _, _, precip_mm = precip_rows[i]
+                  _, _, cloud_percent = cloud_rows[i]
+                  _, _, pressure_pa = pressure_rows[i]
 
                   tile = tile_name(
                       lat,
@@ -306,8 +323,10 @@ jobs:
                       tiles[tile] = {
                           "points": {},
                           "bounds": {
-                              "lat": math.floor(lat),
-                              "lon": math.floor(lon)
+                              "lat":
+                                  math.floor(lat),
+                              "lon":
+                                  math.floor(lon)
                           }
                       }
 
@@ -324,9 +343,14 @@ jobs:
                       tiles[tile]["points"][
                           point_key
                       ] = {
-                          "lat": round(lat, 4),
-                          "lon": round(lon, 4),
-                          "forecast": []
+                          "lat":
+                              round(lat, 4),
+
+                          "lon":
+                              round(lon, 4),
+
+                          "forecast":
+                              []
                       }
 
                   speed_ms = math.sqrt(
@@ -344,9 +368,7 @@ jobs:
                       + 360
                   ) % 360
 
-                  tiles[tile]["points"][
-                      point_key
-                  ]["forecast"].append({
+                  forecast = {
                       "hour":
                           forecast_hour,
 
@@ -368,10 +390,47 @@ jobs:
                       "wind_direction_deg":
                           round(
                               direction
-                          )
-                  })
+                          ),
 
-                  point_number += 1
+                      "wind_gust_kmh":
+                          round(
+                              gust_ms * 3.6,
+                              1
+                          ),
+
+                      "precipitation_mm":
+                          round(
+                              max(
+                                  precip_mm,
+                                  0.0
+                              ),
+                              2
+                          ),
+
+                      "cloud_cover_percent":
+                          round(
+                              max(
+                                  0.0,
+                                  min(
+                                      100.0,
+                                      cloud_percent
+                                  )
+                              ),
+                              1
+                          ),
+
+                      "pressure_msl_hpa":
+                          round(
+                              pressure_pa / 100.0,
+                              1
+                          )
+                  }
+
+                  tiles[tile]["points"][
+                      point_key
+                  ]["forecast"].append(
+                      forecast
+                  )
 
           generated_at = datetime.now(
               timezone.utc
@@ -387,7 +446,9 @@ jobs:
                   ].values()
               )
 
-              total_points += len(points)
+              total_points += len(
+                  points
+              )
 
               output = {
                   "status":
@@ -421,6 +482,16 @@ jobs:
 
                   "attribution":
                       "Deutscher Wetterdienst (DWD)",
+
+                  "parameters": [
+                      "temperature_c",
+                      "wind_speed_kmh",
+                      "wind_direction_deg",
+                      "wind_gust_kmh",
+                      "precipitation_mm",
+                      "cloud_cover_percent",
+                      "pressure_msl_hpa"
+                  ],
 
                   "sampling_step":
                       sampling_step,
@@ -480,6 +551,16 @@ jobs:
               "sampling_step":
                   sampling_step,
 
+              "parameters": [
+                  "temperature_c",
+                  "wind_speed_kmh",
+                  "wind_direction_deg",
+                  "wind_gust_kmh",
+                  "precipitation_mm",
+                  "cloud_cover_percent",
+                  "pressure_msl_hpa"
+              ],
+
               "attribution":
                   "Deutscher Wetterdienst (DWD)",
 
@@ -529,9 +610,14 @@ jobs:
       - name: Kachelarchiv erstellen
         if: steps.changed.outputs.new_data == 'true'
         run: |
-          tar -czf icon-d2-tiles.tar.gz tiles
+          tar -czf \
+            icon-d2-tiles.tar.gz \
+            tiles
 
-          ls -lh icon-d2-tiles.tar.gz
+          ls -lh \
+            icon-d2-tiles.tar.gz
+
+          echo -n "Kachelanzahl: "
           ls tiles | wc -l
 
       - name: ICON-D2 Kacheln zu STRATO übertragen
