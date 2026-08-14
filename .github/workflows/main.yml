@@ -15,7 +15,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libeccodes-tools bzip2 sshpass
 
-      - name: Neuesten verfügbaren ICON-D2 Lauf finden
+      - name: Neuesten vollständigen ICON-D2 Lauf finden
         id: detect
         run: |
           python3 <<'PY'
@@ -46,9 +46,6 @@ jobs:
                   f"icon-d2/grib/{hour}"
               )
 
-              # Wir prüfen Forecast 024 gleich mit.
-              # Damit wird nur ein Lauf verwendet,
-              # dessen 24-h-Daten bereits verfügbar sind.
               files = [
                   f"{base_url}/u_10m/"
                   f"icon-d2_germany_regular-lat-lon_single-level_"
@@ -63,7 +60,7 @@ jobs:
                   f"{date}{hour}_024_2d_t_2m.grib2.bz2"
               ]
 
-              ok = True
+              complete = True
 
               for url in files:
                   try:
@@ -77,14 +74,14 @@ jobs:
                           timeout=15
                       ) as response:
                           if response.status != 200:
-                              ok = False
+                              complete = False
                               break
 
                   except Exception:
-                      ok = False
+                      complete = False
                       break
 
-              if ok:
+              if complete:
                   found = (date, hour)
                   break
 
@@ -114,12 +111,12 @@ jobs:
 
           REMOTE_RUN=$(
             curl -fsS \
-            "https://www.orend.org/paraweather-data/icon-d2-24h-run.txt" \
+            "https://www.orend.org/paraweather-data/icon-d2-tiles-run.txt" \
             2>/dev/null || true
           )
 
           echo "DWD Lauf: $CURRENT_RUN"
-          echo "STRATO 24h Lauf: $REMOTE_RUN"
+          echo "STRATO Kachel-Lauf: $REMOTE_RUN"
 
           if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
             echo "Kein neuer Modelllauf."
@@ -161,13 +158,14 @@ jobs:
             bunzip2 "grib/t_${FSTEP}.grib2.bz2"
           done
 
-      - name: ICON-D2 0-24h Raster erzeugen
+      - name: ICON-D2 Kacheln 0-24h erzeugen
         if: steps.changed.outputs.new_data == 'true'
         run: |
           python3 <<'PY'
           import subprocess
           import json
           import math
+          import os
           from datetime import datetime, timezone, timedelta
 
           RUN_ID = "${{ steps.detect.outputs.run_id }}"
@@ -175,7 +173,14 @@ jobs:
           run_time = datetime.strptime(
               RUN_ID,
               "%Y%m%d%H"
-          ).replace(tzinfo=timezone.utc)
+          ).replace(
+              tzinfo=timezone.utc
+          )
+
+          os.makedirs(
+              "tiles",
+              exist_ok=True
+          )
 
           def read_values(path):
               output = subprocess.check_output(
@@ -199,7 +204,9 @@ jobs:
                   except ValueError:
                       continue
 
-                  rows.append((lat, lon, value))
+                  rows.append(
+                      (lat, lon, value)
+                  )
 
               if not rows:
                   raise RuntimeError(
@@ -208,11 +215,42 @@ jobs:
 
               return rows
 
+          def tile_name(lat, lon):
+              lat_floor = math.floor(lat)
+              lon_floor = math.floor(lon)
+
+              lat_prefix = (
+                  "N"
+                  if lat_floor >= 0
+                  else "S"
+              )
+
+              lon_prefix = (
+                  "E"
+                  if lon_floor >= 0
+                  else "W"
+              )
+
+              return (
+                  f"{lat_prefix}"
+                  f"{abs(lat_floor):02d}_"
+                  f"{lon_prefix}"
+                  f"{abs(lon_floor):03d}"
+              )
+
+          #
+          # Vorläufig weiter jeder 10. Modellpunkt.
+          # Dadurch bleibt das Datenvolumen klein.
+          #
+          # Später können wir die räumliche Auflösung
+          # noch erhöhen, ohne die API-Struktur zu ändern.
+          #
           sampling_step = 10
 
-          points = None
+          tiles = {}
 
           for forecast_hour in range(0, 25):
+
               fstep = f"{forecast_hour:03d}"
 
               print(
@@ -232,49 +270,68 @@ jobs:
               )
 
               if not (
-                  len(u_rows) ==
-                  len(v_rows) ==
-                  len(t_rows)
+                  len(u_rows)
+                  == len(v_rows)
+                  == len(t_rows)
               ):
                   raise RuntimeError(
                       f"Rastergrößen bei +{fstep}h stimmen nicht überein"
                   )
 
               valid_time = (
-                  run_time +
-                  timedelta(hours=forecast_hour)
+                  run_time
+                  + timedelta(
+                      hours=forecast_hour
+                  )
               ).isoformat()
 
-              if points is None:
-                  points = []
-
-                  for i in range(
-                      0,
-                      len(u_rows),
-                      sampling_step
-                  ):
-                      lat, lon, _ = u_rows[i]
-
-                      points.append({
-                          "lat": round(lat, 4),
-                          "lon": round(lon, 4),
-                          "forecast": []
-                      })
-
-              point_index = 0
+              point_number = 0
 
               for i in range(
                   0,
                   len(u_rows),
                   sampling_step
               ):
+
                   lat, lon, u = u_rows[i]
                   _, _, v = v_rows[i]
                   _, _, temp_k = t_rows[i]
 
+                  tile = tile_name(
+                      lat,
+                      lon
+                  )
+
+                  if tile not in tiles:
+                      tiles[tile] = {
+                          "points": {},
+                          "bounds": {
+                              "lat": math.floor(lat),
+                              "lon": math.floor(lon)
+                          }
+                      }
+
+                  point_key = (
+                      f"{round(lat,4)},"
+                      f"{round(lon,4)}"
+                  )
+
+                  if (
+                      point_key
+                      not in
+                      tiles[tile]["points"]
+                  ):
+                      tiles[tile]["points"][
+                          point_key
+                      ] = {
+                          "lat": round(lat, 4),
+                          "lon": round(lon, 4),
+                          "forecast": []
+                      }
+
                   speed_ms = math.sqrt(
-                      u * u +
-                      v * v
+                      u * u
+                      + v * v
                   )
 
                   direction = (
@@ -287,70 +344,197 @@ jobs:
                       + 360
                   ) % 360
 
-                  points[
-                      point_index
+                  tiles[tile]["points"][
+                      point_key
                   ]["forecast"].append({
-                      "hour": forecast_hour,
-                      "valid_time": valid_time,
-                      "temperature_c": round(
-                          temp_k - 273.15,
-                          1
-                      ),
-                      "wind_speed_kmh": round(
-                          speed_ms * 3.6,
-                          1
-                      ),
-                      "wind_direction_deg": round(
-                          direction
-                      )
+                      "hour":
+                          forecast_hour,
+
+                      "valid_time":
+                          valid_time,
+
+                      "temperature_c":
+                          round(
+                              temp_k - 273.15,
+                              1
+                          ),
+
+                      "wind_speed_kmh":
+                          round(
+                              speed_ms * 3.6,
+                              1
+                          ),
+
+                      "wind_direction_deg":
+                          round(
+                              direction
+                          )
                   })
 
-                  point_index += 1
+                  point_number += 1
 
-          result = {
-              "status": "ok",
-              "source": "DWD Open Data",
-              "model": "ICON-D2",
-              "model_run": RUN_ID,
-              "forecast_hours": 24,
-              "forecast_interval_hours": 1,
-              "generated_at": datetime.now(
-                  timezone.utc
-              ).isoformat(),
+          generated_at = datetime.now(
+              timezone.utc
+          ).isoformat()
+
+          total_points = 0
+
+          for tile_name_value, tile_data in tiles.items():
+
+              points = list(
+                  tile_data[
+                      "points"
+                  ].values()
+              )
+
+              total_points += len(points)
+
+              output = {
+                  "status":
+                      "ok",
+
+                  "source":
+                      "DWD Open Data",
+
+                  "model":
+                      "ICON-D2",
+
+                  "model_run":
+                      RUN_ID,
+
+                  "tile":
+                      tile_name_value,
+
+                  "bounds":
+                      tile_data[
+                          "bounds"
+                      ],
+
+                  "forecast_hours":
+                      24,
+
+                  "forecast_interval_hours":
+                      1,
+
+                  "generated_at":
+                      generated_at,
+
+                  "attribution":
+                      "Deutscher Wetterdienst (DWD)",
+
+                  "sampling_step":
+                      sampling_step,
+
+                  "points":
+                      points
+              }
+
+              path = os.path.join(
+                  "tiles",
+                  f"{tile_name_value}.json"
+              )
+
+              with open(
+                  path,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(
+                      output,
+                      f,
+                      separators=(",", ":"),
+                      ensure_ascii=False
+                  )
+
+          index = {
+              "status":
+                  "ok",
+
+              "source":
+                  "DWD Open Data",
+
+              "model":
+                  "ICON-D2",
+
+              "model_run":
+                  RUN_ID,
+
+              "generated_at":
+                  generated_at,
+
+              "tile_size_degrees":
+                  1,
+
+              "tile_count":
+                  len(tiles),
+
+              "total_points":
+                  total_points,
+
+              "forecast_hours":
+                  24,
+
+              "forecast_interval_hours":
+                  1,
+
+              "sampling_step":
+                  sampling_step,
+
               "attribution":
                   "Deutscher Wetterdienst (DWD)",
-              "sampling": {
-                  "step": sampling_step,
-                  "exported_points": len(points)
-              },
-              "points": points
+
+              "tiles":
+                  sorted(
+                      tiles.keys()
+                  )
           }
 
           with open(
-              "icon-d2-24h.json",
+              "icon-d2-index.json",
               "w",
               encoding="utf-8"
           ) as f:
               json.dump(
-                  result,
+                  index,
                   f,
                   separators=(",", ":"),
                   ensure_ascii=False
               )
 
           with open(
-              "icon-d2-24h-run.txt",
+              "icon-d2-tiles-run.txt",
               "w",
               encoding="utf-8"
           ) as f:
-              f.write(RUN_ID)
+              f.write(
+                  RUN_ID
+              )
 
-          print("Modelllauf:", RUN_ID)
-          print("Rasterpunkte:", len(points))
-          print("Zeitschritte je Punkt: 25")
+          print(
+              "Modelllauf:",
+              RUN_ID
+          )
+
+          print(
+              "Kacheln:",
+              len(tiles)
+          )
+
+          print(
+              "Rasterpunkte:",
+              total_points
+          )
           PY
 
-      - name: ICON-D2 24h zu STRATO übertragen
+      - name: Kachelarchiv erstellen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          tar -czf icon-d2-tiles.tar.gz tiles
+
+          ls -lh icon-d2-tiles.tar.gz
+          ls tiles | wc -l
+
+      - name: ICON-D2 Kacheln zu STRATO übertragen
         if: steps.changed.outputs.new_data == 'true'
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
@@ -363,18 +547,40 @@ jobs:
 
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
-            icon-d2-24h.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-24h.json"
+            icon-d2-tiles.tar.gz \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-tiles.tar.gz"
 
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
-            icon-d2-24h-run.txt \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-24h-run.txt"
+            icon-d2-index.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-index.json"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            icon-d2-tiles-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-tiles-run.txt"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            '
+            cd Orend/paraweather-data &&
+            rm -rf icon-d2-tiles-new &&
+            mkdir icon-d2-tiles-new &&
+            tar -xzf icon-d2-tiles.tar.gz -C icon-d2-tiles-new --strip-components=1 &&
+            rm -rf icon-d2-tiles-old &&
+            if [ -d icon-d2-tiles ]; then
+              mv icon-d2-tiles icon-d2-tiles-old
+            fi &&
+            mv icon-d2-tiles-new icon-d2-tiles &&
+            rm -rf icon-d2-tiles-old &&
+            rm -f icon-d2-tiles.tar.gz
+            '
 
       - name: Kein neuer ICON-D2 Lauf
         if: steps.changed.outputs.new_data == 'false'
         run: |
-          echo "ICON-D2 24h ist bereits aktuell."
+          echo "ICON-D2 Kacheldaten sind bereits aktuell."
           echo "Keine GRIB-Dateien geladen."
           echo "Keine Daten neu verarbeitet."
           echo "Kein STRATO-Upload notwendig."
