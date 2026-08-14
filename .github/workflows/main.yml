@@ -1,3 +1,39 @@
+name: ParaWeather ICON-D2 Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  icon-d2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-tools bzip2 sshpass
+
+      - name: ICON-D2 Daten laden
+        run: |
+          RUN=$(date -u +%Y%m%d00)
+          BASE="https://opendata.dwd.de/weather/nwp/icon-d2/grib/00"
+
+          curl -fL \
+            "$BASE/u_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_u_10m.grib2.bz2" \
+            -o u.grib2.bz2
+
+          curl -fL \
+            "$BASE/v_10m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_v_10m.grib2.bz2" \
+            -o v.grib2.bz2
+
+          curl -fL \
+            "$BASE/t_2m/icon-d2_germany_regular-lat-lon_single-level_${RUN}_000_2d_t_2m.grib2.bz2" \
+            -o t.grib2.bz2
+
+          bunzip2 u.grib2.bz2
+          bunzip2 v.grib2.bz2
+          bunzip2 t.grib2.bz2
+
       - name: ICON-D2 Raster auslesen
         run: |
           python3 <<'PY'
@@ -44,6 +80,7 @@
 
           points = []
 
+          # Vorläufig datensparsam: jeder 10. Rasterpunkt
           step = 10
 
           for i in range(0, len(u_rows), step):
@@ -89,3 +126,17 @@
           print("Original Rasterpunkte:", len(u_rows))
           print("Exportierte Rasterpunkte:", len(points))
           PY
+
+      - name: ICON-D2 zu STRATO übertragen
+        env:
+          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mkdir -p Orend/paraweather-data"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            icon-d2-grid.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-d2-grid.json"
