@@ -2,12 +2,19 @@ name: ParaWeather ICON-EU Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Lauf für einen vollständigen Test erneut verarbeiten"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "10 */1 * * *"
 
 jobs:
   icon-eu:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
       - name: Werkzeuge installieren
@@ -138,7 +145,13 @@ jobs:
           echo "DWD ICON-EU Lauf: $CURRENT_RUN"
           echo "STRATO ICON-EU Lauf: $REMOTE_RUN"
 
-          if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.force }}" = "true" ]; then
+
+            echo "Volltest angefordert. Lauf wird erneut verarbeitet."
+            echo "new_data=true" >> "$GITHUB_OUTPUT"
+
+          elif [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
 
             echo "Kein neuer Modelllauf."
             echo "new_data=false" >> "$GITHUB_OUTPUT"
@@ -705,6 +718,8 @@ jobs:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
 
         run: |
+          set -euo pipefail
+
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
@@ -718,12 +733,7 @@ jobs:
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
             icon-eu-index.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-index.json"
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            icon-eu-run.txt \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-run.txt"
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-index.json.new"
 
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
@@ -735,14 +745,27 @@ jobs:
             tar -xzf icon-eu-tiles.tar.gz \
               -C icon-eu-tiles-new \
               --strip-components=1 &&
+            test -n "$(find icon-eu-tiles-new -type f -name "*.json" -print -quit)" &&
             rm -rf icon-eu-tiles-old &&
             if [ -d icon-eu-tiles ]; then
               mv icon-eu-tiles icon-eu-tiles-old
             fi &&
             mv icon-eu-tiles-new icon-eu-tiles &&
+            mv icon-eu-index.json.new icon-eu-index.json &&
             rm -rf icon-eu-tiles-old &&
             rm -f icon-eu-tiles.tar.gz
             '
+
+          # Der Laufmarker wird absichtlich zuletzt veröffentlicht.
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            icon-eu-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-run.txt.new"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mv Orend/paraweather-data/icon-eu-run.txt.new Orend/paraweather-data/icon-eu-run.txt"
 
       - name: Kein neuer ICON-EU Lauf
         if: steps.changed.outputs.new_data == 'false'
