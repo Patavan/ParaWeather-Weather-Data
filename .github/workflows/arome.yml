@@ -8,728 +8,571 @@ on:
 jobs:
   arome:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
-
-      # ============================================================
-      # 1. WERKZEUGE
-      # ============================================================
-
       - name: Werkzeuge installieren
         run: |
           set -euo pipefail
-
           sudo apt-get update -qq
-
           sudo apt-get install -y -qq \
-            curl \
-            jq \
-            sshpass
+            curl jq libeccodes-tools python3-eccodes python3-numpy sshpass
 
-
-      # ============================================================
-      # 2. OFFIZIELLEN AROME-DATENSATZ LADEN
-      # ============================================================
-
-      - name: AROME 0.01 Datenkatalog laden
-        run: |
-          set -euo pipefail
-
-          DATASET_URL="https://www.data.gouv.fr/api/1/datasets/paquets-arome-resolution-0-01deg/"
-
-          echo
-          echo "================================"
-          echo "AROME 0.01 Datenkatalog"
-          echo "================================"
-          echo
-
-          HTTP_CODE=$(
-            curl \
-              --silent \
-              --show-error \
-              --location \
-              --retry 3 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              --output arome-dataset.json \
-              --write-out "%{http_code}" \
-              "$DATASET_URL"
-          )
-
-          echo "HTTP Status: ${HTTP_CODE}"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-
-            echo "AROME Datenkatalog konnte nicht geladen werden."
-
-            exit 1
-
-          fi
-
-          jq -e . \
-            arome-dataset.json \
-            >/dev/null
-
-          RESOURCE_COUNT=$(
-            jq \
-              '.resources | length' \
-              arome-dataset.json
-          )
-
-          echo
-          echo "AROME Ressourcen:"
-          echo "$RESOURCE_COUNT"
-
-          if [ "$RESOURCE_COUNT" -lt 1 ]; then
-
-            echo "Keine AROME Ressourcen vorhanden."
-
-            exit 1
-
-          fi
-
-
-      # ============================================================
-      # 3. AROME-GRIB-RESSOURCEN AUFLÖSEN
-      # ============================================================
-
-      - name: AROME Ressourcen analysieren
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-
-          import json
-          import re
-          import subprocess
-          from collections import defaultdict
-
-
-          with open(
-              "arome-dataset.json",
-              "r",
-              encoding="utf-8"
-          ) as file:
-
-              dataset = json.load(
-                  file
-              )
-
-
-          resources = dataset.get(
-              "resources",
-              []
-          )
-
-
-          print(
-              "Ressourcen insgesamt:",
-              len(resources)
-          )
-
-
-          pattern = re.compile(
-              r"/arome/001/"
-              r"(SP1|SP2|HP1)/"
-              r"arome__001__"
-              r"(SP1|SP2|HP1)__"
-              r"(\d{2})H__"
-              r"([^/]+)\.grib2"
-          )
-
-
-          resolved = []
-
-
-          for number, resource in enumerate(
-              resources,
-              start=1
-          ):
-
-              url = (
-                  resource.get("url")
-                  or
-                  resource.get("latest")
-                  or
-                  ""
-              )
-
-
-              if not url:
-
-                  continue
-
-
-              resource_format = (
-                  resource.get(
-                      "format",
-                      ""
-                  )
-                  or ""
-              ).lower()
-
-
-              if (
-                  resource_format
-                  and
-                  "grib" not in resource_format
-              ):
-
-                  continue
-
-
-              try:
-
-                  result = subprocess.run(
-                      [
-                          "curl",
-                          "--silent",
-                          "--show-error",
-                          "--location",
-                          "--head",
-                          "--retry",
-                          "2",
-                          "--connect-timeout",
-                          "15",
-                          "--max-time",
-                          "30",
-                          "--write-out",
-                          "%{url_effective}",
-                          "--output",
-                          "/dev/null",
-                          url
-                      ],
-                      text=True,
-                      capture_output=True,
-                      check=True
-                  )
-
-                  effective_url = (
-                      result.stdout.strip()
-                  )
-
-              except subprocess.CalledProcessError as error:
-
-                  print(
-                      "HEAD fehlgeschlagen:",
-                      url
-                  )
-
-                  continue
-
-
-              match = pattern.search(
-                  effective_url
-              )
-
-
-              if not match:
-
-                  continue
-
-
-              directory_package = (
-                  match.group(1)
-              )
-
-              filename_package = (
-                  match.group(2)
-              )
-
-              forecast_hour = int(
-                  match.group(3)
-              )
-
-              run = (
-                  match.group(4)
-              )
-
-
-              if (
-                  directory_package
-                  != filename_package
-              ):
-
-                  continue
-
-
-              resolved.append({
-                  "package":
-                      directory_package,
-
-                  "forecast_hour":
-                      forecast_hour,
-
-                  "run":
-                      run,
-
-                  "resource_url":
-                      url,
-
-                  "download_url":
-                      effective_url
-              })
-
-
-              print(
-                  f"{directory_package} "
-                  f"+{forecast_hour:02d}h "
-                  f"{run}"
-              )
-
-
-          if not resolved:
-
-              raise RuntimeError(
-                  "Keine AROME-0.01-GRIB2-Ressourcen erkannt"
-              )
-
-
-          with open(
-              "arome-resources.json",
-              "w",
-              encoding="utf-8"
-          ) as file:
-
-              json.dump(
-                  resolved,
-                  file,
-                  ensure_ascii=False,
-                  indent=2
-              )
-
-
-          print()
-          print(
-              "Erkannte AROME-GRIB-Ressourcen:",
-              len(resolved)
-          )
-
-          PY
-
-
-      # ============================================================
-      # 4. NEUESTEN GEMEINSAMEN AROME-LAUF BESTIMMEN
-      # ============================================================
-
-      - name: Neuesten vollständigen AROME Lauf bestimmen
+      - name: Vollständigen AROME Lauf 0-24h bestimmen
         id: detect
         run: |
           set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-delay 2 --retry-all-errors \
+            "https://www.data.gouv.fr/api/1/datasets/paquets-arome-resolution-0-01deg/" \
+            -o arome-dataset.json
 
           python3 <<'PY'
-
           import json
           import os
+          import re
+          from collections import defaultdict
 
-          from collections import (
-              defaultdict
+          PACKAGES = ("SP1", "SP2", "HP1")
+          HOURS = set(range(25))
+
+          with open("arome-dataset.json", encoding="utf-8") as handle:
+              dataset = json.load(handle)
+
+          pattern = re.compile(
+              r"/arome/001/(SP1|SP2|HP1)/"
+              r"arome__001__(SP1|SP2|HP1)__(\d{2})H__([^/]+)\.grib2(?:\?.*)?$"
           )
+          resources = []
+          runs = defaultdict(lambda: defaultdict(set))
 
+          for resource in dataset.get("resources", []):
+              match = None
+              url = ""
+              for candidate in (resource.get("url", ""), resource.get("latest", "")):
+                  match = pattern.search(candidate)
+                  if match:
+                      url = candidate
+                      break
+              if not match:
+                  continue
 
-          with open(
-              "arome-resources.json",
-              "r",
-              encoding="utf-8"
-          ) as file:
+              directory_package, filename_package, hour_text, run = match.groups()
+              hour = int(hour_text)
+              if directory_package != filename_package or hour not in HOURS:
+                  continue
 
-              resources = json.load(
-                  file
-              )
-
-
-          runs = defaultdict(
-              lambda: defaultdict(set)
-          )
-
-
-          for item in resources:
-
-              runs[
-                  item["run"]
-              ][
-                  item["package"]
-              ].add(
-                  item["forecast_hour"]
-              )
-
-
-          required_packages = [
-              "SP1",
-              "SP2",
-              "HP1"
-          ]
-
-
-          candidates = []
-
-
-          for run, packages in runs.items():
-
-              package_counts = {
-                  package:
-                      len(
-                          packages.get(
-                              package,
-                              set()
-                          )
-                      )
-                  for package
-                  in required_packages
-              }
-
-
-              print(
-                  run,
-                  package_counts
-              )
-
-
-              #
-              # Mindestens +00h muss für
-              # alle drei Pakete vorhanden sein.
-              #
-              complete = all(
-                  0 in packages.get(
-                      package,
-                      set()
-                  )
-                  for package
-                  in required_packages
-              )
-
-
-              if complete:
-
-                  candidates.append(
-                      run
-                  )
-
-
-          if not candidates:
-
-              raise RuntimeError(
-                  "Kein gemeinsamer AROME Lauf "
-                  "für SP1, SP2 und HP1 gefunden"
-              )
-
-
-          selected_run = sorted(
-              candidates
-          )[-1]
-
-
-          print()
-          print(
-              "Verwendeter AROME Lauf:",
-              selected_run
-          )
-
-
-          with open(
-              os.environ[
-                  "GITHUB_OUTPUT"
-              ],
-              "a"
-          ) as output:
-
-              output.write(
-                  f"run={selected_run}\n"
-              )
-
-          PY
-
-
-      # ============================================================
-      # 5. AROME STATUS ERZEUGEN
-      # ============================================================
-
-      - name: AROME Status erzeugen
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-
-          import json
-
-          from datetime import (
-              datetime,
-              timezone
-          )
-
-
-          RUN = (
-              "${{ steps.detect.outputs.run }}"
-          )
-
-
-          with open(
-              "arome-resources.json",
-              "r",
-              encoding="utf-8"
-          ) as file:
-
-              resources = json.load(
-                  file
-              )
-
-
-          selected = [
-              item
-              for item in resources
-              if item["run"] == RUN
-          ]
-
-
-          packages = {}
-
-
-          for package in [
-              "SP1",
-              "SP2",
-              "HP1"
-          ]:
-
-              hours = sorted({
-                  item[
-                      "forecast_hour"
-                  ]
-                  for item in selected
-                  if item[
-                      "package"
-                  ] == package
+              resources.append({
+                  "package": directory_package,
+                  "forecast_hour": hour,
+                  "run": run,
+                  "download_url": url,
               })
+              runs[run][directory_package].add(hour)
 
-
-              packages[
-                  package
-              ] = {
-                  "available":
-                      bool(hours),
-
-                  "forecast_hours":
-                      hours,
-
-                  "count":
-                      len(hours)
-              }
-
-
-          status = {
-
-              "status":
-                  "ok",
-
-              "source":
-                  "Météo-France / data.gouv.fr",
-
-              "model":
-                  "AROME",
-
-              "resolution_deg":
-                  0.01,
-
-              "grid":
-                  "EURW1S100",
-
-              "format":
-                  "GRIB2",
-
-              "model_run":
-                  RUN,
-
-              "generated_at":
-                  datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-
-              "authentication_required":
-                  False,
-
-              "packages":
-                  packages,
-
-              "dataset":
-                  "Paquets Arome - Résolution 0,01°",
-
-              "attribution":
-                  "Météo-France",
-
-              "license":
-                  "Licence Ouverte / Open Licence 2.0"
-          }
-
-
-          with open(
-              "arome-status.json",
-              "w",
-              encoding="utf-8"
-          ) as file:
-
-              json.dump(
-                  status,
-                  file,
-                  ensure_ascii=False,
-                  indent=2
-              )
-
-
-          print(
-              json.dumps(
-                  status,
-                  ensure_ascii=False,
-                  indent=2
-              )
-          )
-
-          PY
-
-
-      # ============================================================
-      # 6. DOWNLOAD-MANIFEST ERZEUGEN
-      # ============================================================
-
-      - name: AROME Download-Manifest erzeugen
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-
-          import json
-
-
-          RUN = (
-              "${{ steps.detect.outputs.run }}"
-          )
-
-
-          with open(
-              "arome-resources.json",
-              "r",
-              encoding="utf-8"
-          ) as file:
-
-              resources = json.load(
-                  file
-              )
-
-
-          selected = [
-              item
-              for item in resources
-              if item["run"] == RUN
-              and
-              item["package"] in (
-                  "SP1",
-                  "SP2",
-                  "HP1"
-              )
+          complete = [
+              run for run, packages in runs.items()
+              if all(packages.get(package, set()) == HOURS for package in PACKAGES)
           ]
-
-
-          selected.sort(
-              key=lambda item: (
-                  item["package"],
-                  item["forecast_hour"]
+          if not complete:
+              summary = {
+                  run: {package: len(values.get(package, set())) for package in PACKAGES}
+                  for run, values in runs.items()
+              }
+              raise RuntimeError(
+                  "Kein vollständiger gemeinsamer AROME-Lauf 0-24h: "
+                  + json.dumps(summary, ensure_ascii=False)
               )
-          )
 
+          selected_run = sorted(complete)[-1]
+          selected = sorted(
+              (item for item in resources if item["run"] == selected_run),
+              key=lambda item: (item["forecast_hour"], item["package"]),
+          )
+          if len(selected) != 75:
+              raise RuntimeError(f"AROME-Manifest: {len(selected)} statt 75 Dateien")
 
           manifest = {
-
-              "model":
-                  "AROME",
-
-              "resolution_deg":
-                  0.01,
-
-              "model_run":
-                  RUN,
-
-              "resources":
-                  selected
+              "model": "AROME",
+              "resolution_deg": 0.01,
+              "model_run": selected_run,
+              "forecast_hours": list(range(25)),
+              "packages": list(PACKAGES),
+              "resources": selected,
           }
+          with open("arome-download-manifest.json", "w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, ensure_ascii=False, indent=2)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"run={selected_run}\n")
 
-
-          with open(
-              "arome-download-manifest.json",
-              "w",
-              encoding="utf-8"
-          ) as file:
-
-              json.dump(
-                  manifest,
-                  file,
-                  ensure_ascii=False,
-                  indent=2
-              )
-
-
-          print(
-              "Manifest-Ressourcen:",
-              len(selected)
-          )
-
+          print("Verwendeter AROME-Lauf:", selected_run)
+          print("Dateien:", len(selected))
           PY
 
-
-      # ============================================================
-      # 7. ZU STRATO ÜBERTRAGEN
-      # ============================================================
-
-      - name: AROME Metadaten zu STRATO übertragen
-        env:
-
-          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
-
+      - name: Prüfen ob Lauf bereits verarbeitet wurde
+        id: changed
         run: |
           set -euo pipefail
+          CURRENT_RUN="${{ steps.detect.outputs.run }}"
+          REMOTE_RUN=$(curl -fsS \
+            "https://www.orend.org/paraweather-data/arome-tiles-run.txt" \
+            2>/dev/null || true)
 
-          echo
-          echo "================================"
-          echo "AROME Upload zu STRATO"
-          echo "================================"
-          echo
+          echo "Météo-France Lauf: ${CURRENT_RUN}"
+          echo "STRATO Lauf:        ${REMOTE_RUN}"
+          if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+            echo "new_data=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_data=true" >> "$GITHUB_OUTPUT"
+          fi
 
+      - name: AROME SP1 SP2 HP1 0-24h herunterladen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import subprocess
 
-          sshpass -e ssh \
-            -o StrictHostKeyChecking=no \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+          with open("arome-download-manifest.json", encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          os.makedirs("grib", exist_ok=True)
+
+          def download(item):
+              package = item["package"]
+              hour = item["forecast_hour"]
+              directory = os.path.join("grib", package)
+              os.makedirs(directory, exist_ok=True)
+              target = os.path.join(directory, f"{hour:02d}.grib2")
+              subprocess.run([
+                  "curl", "--fail", "--silent", "--show-error", "--location",
+                  "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
+                  item["download_url"], "-o", target,
+              ], check=True)
+              with open(target, "rb") as handle:
+                  signature = handle.read(4)
+              size = os.path.getsize(target)
+              if signature != b"GRIB" or size < 1000:
+                  raise RuntimeError(f"Ungültige AROME-Datei: {target}")
+              return package, hour, size
+
+          total = 0
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+              futures = [executor.submit(download, item) for item in manifest["resources"]]
+              for future in concurrent.futures.as_completed(futures):
+                  package, hour, size = future.result()
+                  total += size
+                  print(f"{package} +{hour:02d}h: {size / 1024 / 1024:.1f} MiB")
+          print(f"Download gesamt: {total / 1024 / 1024:.1f} MiB")
+          PY
+
+      - name: AROME Boden- und Höhenwind-Kacheln erzeugen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import gc
+          import json
+          import math
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          import numpy as np
+          from eccodes import (
+              codes_get,
+              codes_get_values,
+              codes_grib_new_from_file,
+              codes_release,
+          )
+
+          RUN = "${{ steps.detect.outputs.run }}"
+          RUN_TIME = datetime.fromisoformat(RUN.replace("Z", "+00:00"))
+          SAMPLE_STEP = 10
+          HEIGHTS = (10, 20, 50, 100)
+
+          def get(message, key, default=None):
+              try:
+                  return codes_get(message, key)
+              except Exception:
+                  return default
+
+          def coordinates(message):
+              ni = int(codes_get(message, "Ni"))
+              nj = int(codes_get(message, "Nj"))
+              first_lat = float(codes_get(message, "latitudeOfFirstGridPointInDegrees"))
+              first_lon = float(codes_get(message, "longitudeOfFirstGridPointInDegrees"))
+              di = float(codes_get(message, "iDirectionIncrementInDegrees"))
+              dj = float(codes_get(message, "jDirectionIncrementInDegrees"))
+              i_sign = -1.0 if int(codes_get(message, "iScansNegatively")) else 1.0
+              j_sign = 1.0 if int(codes_get(message, "jScansPositively")) else -1.0
+              latitudes = first_lat + j_sign * dj * np.arange(0, nj, SAMPLE_STEP)
+              longitudes = first_lon + i_sign * di * np.arange(0, ni, SAMPLE_STEP)
+              longitudes = np.where(longitudes > 180.0, longitudes - 360.0, longitudes)
+              return ni, nj, latitudes, longitudes
+
+          def sampled_values(message, ni, nj):
+              values = np.asarray(codes_get_values(message), dtype=np.float64)
+              return values.reshape(nj, ni)[::SAMPLE_STEP, ::SAMPLE_STEP]
+
+          def read_surface(path, wanted):
+              fields = {}
+              grid = None
+              with open(path, "rb") as handle:
+                  while True:
+                      message = codes_grib_new_from_file(handle)
+                      if message is None:
+                          break
+                      try:
+                          output_name = wanted.get(get(message, "shortName", ""))
+                          if output_name is None:
+                              continue
+                          if grid is None:
+                              ni, nj, latitudes, longitudes = coordinates(message)
+                              grid = (ni, nj, latitudes, longitudes)
+                          fields[output_name] = sampled_values(message, grid[0], grid[1])
+                      finally:
+                          codes_release(message)
+              return grid, fields
+
+          def read_upper(path):
+              winds = {}
+              grid = None
+              with open(path, "rb") as handle:
+                  while True:
+                      message = codes_grib_new_from_file(handle)
+                      if message is None:
+                          break
+                      try:
+                          if get(message, "typeOfLevel", "") != "heightAboveGround":
+                              continue
+                          level = int(get(message, "level", -1))
+                          if level not in HEIGHTS:
+                              continue
+                          short_name = get(message, "shortName", "")
+                          if short_name in ("10u", "100u", "u"):
+                              component = "u"
+                          elif short_name in ("10v", "100v", "v"):
+                              component = "v"
+                          else:
+                              continue
+                          if grid is None:
+                              ni, nj, latitudes, longitudes = coordinates(message)
+                              grid = (ni, nj, latitudes, longitudes)
+                          winds.setdefault(level, {})[component] = sampled_values(
+                              message, grid[0], grid[1]
+                          )
+                      finally:
+                          codes_release(message)
+              return grid, winds
+
+          def tile_name(lat, lon):
+              lat_floor = math.floor(lat)
+              lon_floor = math.floor(lon)
+              return (
+                  ("N" if lat_floor >= 0 else "S") + f"{abs(lat_floor):02d}_"
+                  + ("E" if lon_floor >= 0 else "W") + f"{abs(lon_floor):03d}"
+              )
+
+          def is_valid(value):
+              return np.isfinite(value) and abs(value) < 1.0e19
+
+          def write_tiles(directory, tiles, dataset, extra):
+              os.makedirs(directory, exist_ok=True)
+              generated_at = datetime.now(timezone.utc).isoformat()
+              names = sorted(tiles)
+              total_points = 0
+              for tile in names:
+                  points = list(tiles[tile].values())
+                  total_points += len(points)
+                  payload = {
+                      "status": "ok",
+                      "source": "Météo-France / data.gouv.fr",
+                      "model": "AROME",
+                      "model_run": RUN,
+                      "dataset": dataset,
+                      "tile": tile,
+                      "grid": "regular-lat-lon",
+                      "source_resolution_deg": 0.01,
+                      "spatial_sampling_deg": 0.1,
+                      "forecast_hours": 24,
+                      "forecast_interval_hours": 1,
+                      "generated_at": generated_at,
+                      "attribution": "Météo-France",
+                      "points": points,
+                      **extra,
+                  }
+                  with open(f"{directory}/{tile}.json", "w", encoding="utf-8") as handle:
+                      json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+              return generated_at, names, total_points
+
+          # Bodenfelder aus SP1 und SP2.
+          surface_tiles = {}
+          for hour in range(25):
+              print(f"Verarbeite AROME Boden +{hour:02d}h")
+              grid1, sp1 = read_surface(f"grib/SP1/{hour:02d}.grib2", {
+                  "2t": "temperature", "2r": "humidity", "10u": "u", "10v": "v",
+                  "max_10efg": "gust_u", "max_10nfg": "gust_v",
+              })
+              grid2, sp2 = read_surface(f"grib/SP2/{hour:02d}.grib2", {
+                  "sp": "pressure", "lcc": "cloud_low", "mcc": "cloud_mid",
+                  "hcc": "cloud_high", "tirf": "rain", "tsnowp": "snow",
+                  "tgrp": "graupel",
+              })
+              required = [name for name in ("temperature", "humidity", "u", "v") if name not in sp1]
+              if "pressure" not in sp2:
+                  required.append("pressure")
+              if grid1 is None or grid2 is None or required:
+                  raise RuntimeError(f"AROME-Bodenfelder fehlen +{hour:02d}h: {required}")
+              if sp1["temperature"].shape != sp2["pressure"].shape:
+                  raise RuntimeError(f"SP1/SP2-Gitter unterscheiden sich +{hour:02d}h")
+
+              latitudes, longitudes = grid1[2], grid1[3]
+              shape = sp1["temperature"].shape
+              zeros = np.zeros(shape, dtype=np.float64)
+              gust_u = sp1.get("gust_u", sp1["u"])
+              gust_v = sp1.get("gust_v", sp1["v"])
+              cloud = np.maximum.reduce([
+                  sp2.get("cloud_low", zeros), sp2.get("cloud_mid", zeros),
+                  sp2.get("cloud_high", zeros),
+              ])
+              precipitation = (
+                  sp2.get("rain", zeros) + sp2.get("snow", zeros)
+                  + sp2.get("graupel", zeros)
+              )
+              valid_time = (RUN_TIME + timedelta(hours=hour)).isoformat()
+
+              for row, lat in enumerate(latitudes):
+                  for column, lon in enumerate(longitudes):
+                      values = (
+                          sp1["temperature"][row, column], sp1["humidity"][row, column],
+                          sp1["u"][row, column], sp1["v"][row, column],
+                          sp2["pressure"][row, column],
+                      )
+                      if not all(is_valid(value) for value in values):
+                          continue
+                      temperature, humidity, u, v, pressure = map(float, values)
+                      gu, gv = gust_u[row, column], gust_v[row, column]
+                      gust = math.hypot(float(gu), float(gv)) if is_valid(gu) and is_valid(gv) else math.hypot(u, v)
+                      direction = (math.degrees(math.atan2(-u, -v)) + 360.0) % 360.0
+                      tile = tile_name(float(lat), float(lon))
+                      key = f"{float(lat):.2f},{float(lon):.2f}"
+                      point = surface_tiles.setdefault(tile, {}).setdefault(key, {
+                          "lat": round(float(lat), 2), "lon": round(float(lon), 2),
+                          "forecast": [],
+                      })
+                      point["forecast"].append({
+                          "hour": hour, "valid_time": valid_time,
+                          "temperature_c": round(temperature - 273.15, 1),
+                          "relative_humidity_percent": round(max(0.0, min(100.0, humidity)), 1),
+                          "wind_speed_kmh": round(math.hypot(u, v) * 3.6, 1),
+                          "wind_direction_deg": round(direction),
+                          "wind_gust_kmh": round(gust * 3.6, 1),
+                          "precipitation_mm": round(max(0.0, float(precipitation[row, column])), 2),
+                          "cloud_cover_percent": round(max(0.0, min(100.0, float(cloud[row, column]))), 1),
+                          "pressure_surface_hpa": round(pressure / 100.0, 1),
+                      })
+
+          surface_generated, surface_names, surface_points = write_tiles(
+              "surface-tiles", surface_tiles, "surface", {}
+          )
+          surface_index = {
+              "status": "ok", "source": "Météo-France / data.gouv.fr",
+              "model": "AROME", "model_run": RUN, "dataset": "surface",
+              "generated_at": surface_generated, "tile_count": len(surface_names),
+              "total_points": surface_points, "forecast_hours": 24,
+              "forecast_interval_hours": 1, "source_resolution_deg": 0.01,
+              "spatial_sampling_deg": 0.1, "attribution": "Météo-France",
+              "tiles": surface_names,
+          }
+          with open("arome-index.json", "w", encoding="utf-8") as handle:
+              json.dump(surface_index, handle, ensure_ascii=False, separators=(",", ":"))
+          print("Bodenkacheln:", len(surface_names), "Punkte:", surface_points)
+
+          del surface_tiles
+          gc.collect()
+
+          # Höhenwind aus HP1 auf real vorhandenen Höhen über Grund.
+          upper_tiles = {}
+          available_heights = set()
+          for hour in range(25):
+              print(f"Verarbeite AROME Höhenwind +{hour:02d}h")
+              grid, winds = read_upper(f"grib/HP1/{hour:02d}.grib2")
+              complete_heights = sorted(
+                  level for level, components in winds.items()
+                  if "u" in components and "v" in components
+              )
+              if grid is None or not complete_heights:
+                  raise RuntimeError(f"Keine vollständigen HP1-U/V-Felder +{hour:02d}h")
+              available_heights.update(complete_heights)
+              latitudes, longitudes = grid[2], grid[3]
+              valid_time = (RUN_TIME + timedelta(hours=hour)).isoformat()
+
+              for row, lat in enumerate(latitudes):
+                  for column, lon in enumerate(longitudes):
+                      levels = []
+                      for height in complete_heights:
+                          u = winds[height]["u"][row, column]
+                          v = winds[height]["v"][row, column]
+                          if not is_valid(u) or not is_valid(v):
+                              continue
+                          u, v = float(u), float(v)
+                          levels.append({
+                              "type": "height_above_ground", "height_m": height,
+                              "wind_speed_kmh": round(math.hypot(u, v) * 3.6, 1),
+                              "wind_direction_deg": round((math.degrees(math.atan2(-u, -v)) + 360.0) % 360.0),
+                          })
+                      if not levels:
+                          continue
+                      tile = tile_name(float(lat), float(lon))
+                      key = f"{float(lat):.2f},{float(lon):.2f}"
+                      point = upper_tiles.setdefault(tile, {}).setdefault(key, {
+                          "lat": round(float(lat), 2), "lon": round(float(lon), 2),
+                          "forecast": [],
+                      })
+                      point["forecast"].append({
+                          "hour": hour, "valid_time": valid_time, "levels": levels,
+                      })
+
+          heights = sorted(available_heights)
+          upper_generated, upper_names, upper_points = write_tiles(
+              "upper-tiles", upper_tiles, "upper_air",
+              {"vertical_coordinate": "height_above_ground", "heights_m": heights},
+          )
+          upper_index = {
+              "status": "ok", "source": "Météo-France / data.gouv.fr",
+              "model": "AROME", "model_run": RUN, "dataset": "upper_air",
+              "vertical_coordinate": "height_above_ground", "heights_m": heights,
+              "generated_at": upper_generated, "tile_count": len(upper_names),
+              "total_points": upper_points, "forecast_hours": 24,
+              "forecast_interval_hours": 1, "source_resolution_deg": 0.01,
+              "spatial_sampling_deg": 0.1, "attribution": "Météo-France",
+              "tiles": upper_names,
+          }
+          with open("arome-upper-index.json", "w", encoding="utf-8") as handle:
+              json.dump(upper_index, handle, ensure_ascii=False, separators=(",", ":"))
+          print("Höhenwindkacheln:", len(upper_names), "Punkte:", upper_points)
+          print("Höhen:", heights)
+          PY
+
+      - name: AROME Ausgaben prüfen und Archive erzeugen
+        if: steps.changed.outputs.new_data == 'true'
+        run: |
+          set -euo pipefail
+          test -s arome-index.json
+          test -s arome-upper-index.json
+          test "$(find surface-tiles -type f -name '*.json' | wc -l)" -gt 0
+          test "$(find upper-tiles -type f -name '*.json' | wc -l)" -gt 0
+          jq -e '.status == "ok" and .tile_count > 0 and .total_points > 0' \
+            arome-index.json >/dev/null
+          jq -e '.status == "ok" and .tile_count > 0 and .total_points > 0' \
+            arome-upper-index.json >/dev/null
+
+          tar -czf arome-tiles.tar.gz surface-tiles
+          tar -czf arome-upper-tiles.tar.gz upper-tiles
+          echo -n "${{ steps.detect.outputs.run }}" > arome-tiles-run.txt
+
+          python3 <<'PY'
+          import json
+          from datetime import datetime, timezone
+
+          with open("arome-index.json", encoding="utf-8") as handle:
+              surface = json.load(handle)
+          with open("arome-upper-index.json", encoding="utf-8") as handle:
+              upper = json.load(handle)
+
+          status = {
+              "status": "ok",
+              "source": "Météo-France / data.gouv.fr",
+              "model": "AROME",
+              "model_run": "${{ steps.detect.outputs.run }}",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "forecast_hours": 24,
+              "surface": {
+                  "tile_count": surface["tile_count"],
+                  "total_points": surface["total_points"],
+              },
+              "upper_air": {
+                  "tile_count": upper["tile_count"],
+                  "total_points": upper["total_points"],
+                  "heights_m": upper["heights_m"],
+              },
+              "attribution": "Météo-France",
+              "license": "Licence Ouverte / Open Licence 2.0",
+          }
+          with open("arome-status.json", "w", encoding="utf-8") as handle:
+              json.dump(status, handle, ensure_ascii=False, indent=2)
+          print(json.dumps(status, ensure_ascii=False, indent=2))
+          PY
+
+          ls -lh \
+            arome-tiles.tar.gz \
+            arome-upper-tiles.tar.gz \
+            arome-index.json \
+            arome-upper-index.json \
+            arome-status.json
+
+      - name: AROME atomar zu STRATO übertragen
+        if: steps.changed.outputs.new_data == 'true'
+        env:
+          SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          REMOTE="${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}"
+          SSH_OPTIONS=(-o StrictHostKeyChecking=no)
+
+          sshpass -e ssh "${SSH_OPTIONS[@]}" "$REMOTE" \
             "mkdir -p Orend/paraweather-data"
 
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
+          for FILE in \
+            arome-tiles.tar.gz \
+            arome-upper-tiles.tar.gz \
+            arome-index.json \
+            arome-upper-index.json \
             arome-status.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-status.json"
+            arome-download-manifest.json
+          do
+            sshpass -e scp "${SSH_OPTIONS[@]}" "$FILE" \
+              "$REMOTE:Orend/paraweather-data/${FILE}.new"
+          done
 
+          sshpass -e ssh "${SSH_OPTIONS[@]}" "$REMOTE" '
+            set -euo pipefail
+            cd Orend/paraweather-data
 
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            arome-download-manifest.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-download-manifest.json"
+            rm -rf arome-tiles-next arome-upper-tiles-next
+            mkdir arome-tiles-next arome-upper-tiles-next
+            tar -xzf arome-tiles.tar.gz.new \
+              -C arome-tiles-next --strip-components=1
+            tar -xzf arome-upper-tiles.tar.gz.new \
+              -C arome-upper-tiles-next --strip-components=1
 
+            test "$(find arome-tiles-next -type f -name "*.json" | wc -l)" -gt 0
+            test "$(find arome-upper-tiles-next -type f -name "*.json" | wc -l)" -gt 0
 
-          echo
-          echo "AROME Metadaten erfolgreich übertragen."
+            rm -rf arome-tiles-old arome-upper-tiles-old
+            if [ -d arome-tiles ]; then mv arome-tiles arome-tiles-old; fi
+            if [ -d arome-upper-tiles ]; then mv arome-upper-tiles arome-upper-tiles-old; fi
+            mv arome-tiles-next arome-tiles
+            mv arome-upper-tiles-next arome-upper-tiles
 
+            mv arome-index.json.new arome-index.json
+            mv arome-upper-index.json.new arome-upper-index.json
+            mv arome-status.json.new arome-status.json
+            mv arome-download-manifest.json.new arome-download-manifest.json
 
-      # ============================================================
-      # 8. ABSCHLUSS
-      # ============================================================
+            rm -rf arome-tiles-old arome-upper-tiles-old
+            rm -f arome-tiles.tar.gz.new arome-upper-tiles.tar.gz.new
+          '
 
-      - name: Abschluss
+          # Marker zuletzt: Erst ein vollständig veröffentlichter Lauf gilt als aktuell.
+          sshpass -e scp "${SSH_OPTIONS[@]}" arome-tiles-run.txt \
+            "$REMOTE:Orend/paraweather-data/arome-tiles-run.txt"
+          echo "AROME erfolgreich aktualisiert."
+
+      - name: Kein neuer AROME Lauf
+        if: steps.changed.outputs.new_data == 'false'
         run: |
-          echo
-          echo "================================"
-          echo "AROME erfolgreich"
-          echo "================================"
-          echo
-          echo "AROME 0.01 Datenquelle: OK"
-          echo "SP1 erkannt"
-          echo "SP2 erkannt"
-          echo "HP1 erkannt"
-          echo "Kein Météo-France API-Token erforderlich"
-          echo "Kein DPPaquetAROME"
-          echo "Kein WCS GetCapabilities"
-          echo
+          echo "AROME ist bereits aktuell."
+          echo "Keine Daten neu geladen oder veröffentlicht."
