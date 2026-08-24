@@ -20,11 +20,34 @@ jobs:
         env:
           METEOFRANCE_BASIC_AUTH: ${{ secrets.METEOFRANCE_BASIC_AUTH }}
         run: |
-          RESPONSE=$(curl -fsS -k \
+          set -euo pipefail
+
+          if [ -z "${METEOFRANCE_BASIC_AUTH:-}" ]; then
+            echo "METEOFRANCE_BASIC_AUTH fehlt."
+            exit 1
+          fi
+
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE=$(curl -sS \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -o "$RESPONSE_FILE" \
+            -w "%{http_code}" \
             -X POST \
             "https://portail-api.meteofrance.fr/token" \
             -d "grant_type=client_credentials" \
             -H "Authorization: Basic ${METEOFRANCE_BASIC_AUTH}")
+
+          echo "Token HTTP Status: ${HTTP_CODE}"
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "Météo-France Token konnte nicht erzeugt werden."
+            cat "$RESPONSE_FILE" || true
+            exit 1
+          fi
+
+          RESPONSE=$(cat "$RESPONSE_FILE")
 
           if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
             ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // .token // empty')
@@ -32,235 +55,226 @@ jobs:
             ACCESS_TOKEN=$(echo "$RESPONSE" | tr -d '\r\n"')
           fi
 
-          if [ -z "$ACCESS_TOKEN" ]; then
-            echo "Kein Access Token erhalten."
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "Kein gültiger Access Token erhalten."
             exit 1
           fi
 
           echo "::add-mask::$ACCESS_TOKEN"
-
-          {
-            echo "access_token<<EOF"
-            echo "$ACCESS_TOKEN"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
           echo "Météo-France Token erfolgreich erzeugt."
 
-      - name: AROME 0.01 Capabilities laden
+      - name: AROME API-Zugang prüfen
         env:
           ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
         run: |
-          HTTP_CODE=$(curl -sS -L \
-            -o arome-capabilities.xml \
-            -w "%{http_code}" \
-            "https://public-api.meteofrance.fr/public/arome/1.0/wcs/MF-NWP-HIGHRES-AROME-001-FRANCE-WCS/GetCapabilities?service=WCS&version=2.0.1&language=eng" \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "accept: */*")
+          set -euo pipefail
 
-          echo "HTTP Status: ${HTTP_CODE}"
+          BASE="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1"
+
+          HTTP_CODE=$(curl -sS -L \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -o arome-grids.json \
+            -w "%{http_code}" \
+            "$BASE/models/AROME/grids" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "accept: text/json")
+
+          echo "AROME Grids HTTP Status: ${HTTP_CODE}"
 
           if [ "${HTTP_CODE}" != "200" ]; then
-            echo "AROME GetCapabilities fehlgeschlagen."
-            cat arome-capabilities.xml || true
+            echo "AROME Package API nicht erreichbar."
+            cat arome-grids.json || true
+            echo
+            echo "Bei HTTP 403 ist DPPaquetAROME im Météo-France-Konto noch nicht freigeschaltet."
             exit 1
           fi
 
-          test -s arome-capabilities.xml
+          jq -e . arome-grids.json >/dev/null
+          echo "AROME Package API erreichbar."
 
-          echo "AROME Capabilities erfolgreich geladen."
-          ls -lh arome-capabilities.xml
-
-      - name: AROME Coverages analysieren
+      - name: AROME 0.01 Raster erkennen
+        id: grid
         run: |
-          python3 <<'PY'
-          import json
-          import xml.etree.ElementTree as ET
-          from datetime import datetime, timezone
+          set -euo pipefail
 
-          tree = ET.parse("arome-capabilities.xml")
-          root = tree.getroot()
+          GRID=$(jq -r '
+            [
+              .links[]?
+              | select(
+                  ((.title // "") | ascii_downcase | contains("0,01"))
+                  or ((.title // "") | ascii_downcase | contains("0.01"))
+                  or ((.href // "") | contains("/0.01"))
+                )
+              | (.href // "" | split("/")[-1])
+            ][0] // empty
+          ' arome-grids.json)
 
-          coverages = []
+          if [ -z "$GRID" ]; then
+            echo "AROME 0.01 Raster nicht automatisch erkannt."
+            jq -r '.links[]? | "- \(.title // "?") -> \(.href // "?")"' arome-grids.json
+            exit 1
+          fi
 
-          for element in root.iter():
-              tag = element.tag.split("}")[-1]
+          echo "Erkanntes AROME Raster: $GRID"
+          echo "grid=$GRID" >> "$GITHUB_OUTPUT"
 
-              if tag in ("CoverageId", "Identifier"):
-                  if element.text:
-                      value = element.text.strip()
+      - name: AROME Pakete laden
+        env:
+          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+        run: |
+          set -euo pipefail
 
-                      if value and value not in coverages:
-                          coverages.append(value)
+          GRID="${{ steps.grid.outputs.grid }}"
+          URL="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1/models/AROME/grids/${GRID}/packages"
 
-          keywords = {
-              "temperature": [
-                  "TEMPERATURE",
-                  "T2M",
-                  "2M"
-              ],
-              "wind_u": [
-                  "UGRD",
-                  "U_COMPONENT",
-                  "U10"
-              ],
-              "wind_v": [
-                  "VGRD",
-                  "V_COMPONENT",
-                  "V10"
-              ],
-              "gust": [
-                  "GUST",
-                  "RAF",
-                  "VMAX"
-              ],
-              "precipitation": [
-                  "PRECIP",
-                  "RAIN",
-                  "RR",
-                  "TP"
-              ],
-              "cloud": [
-                  "CLOUD",
-                  "NEB",
-                  "CLCT"
-              ],
-              "pressure": [
-                  "PRESSURE",
-                  "PMSL",
-                  "MSL"
-              ]
-          }
+          HTTP_CODE=$(curl -sS -L \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -o arome-packages.json \
+            -w "%{http_code}" \
+            "$URL" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "accept: text/json")
 
-          matches = {}
+          echo "AROME Packages HTTP Status: ${HTTP_CODE}"
 
-          for category, words in keywords.items():
-              matches[category] = []
+          if [ "${HTTP_CODE}" != "200" ]; then
+            cat arome-packages.json || true
+            exit 1
+          fi
 
-              for coverage in coverages:
-                  upper = coverage.upper()
+          jq -e . arome-packages.json >/dev/null
+          echo "AROME Paketkatalog erfolgreich geladen."
 
-                  if any(word in upper for word in words):
-                      matches[category].append(coverage)
+      - name: AROME Oberflächenpaket analysieren
+        id: surface
+        env:
+          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+        run: |
+          set -euo pipefail
 
-          result = {
-              "status": "ok",
-              "source": "Météo-France",
-              "model": "AROME",
-              "resolution_deg": 0.01,
-              "service": "WCS 2.0.1",
-              "generated_at": datetime.now(timezone.utc).isoformat(),
-              "coverage_count": len(coverages),
-              "matches": matches,
-              "coverages": coverages
-          }
+          GRID="${{ steps.grid.outputs.grid }}"
+          BASE="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1/models/AROME/grids/${GRID}/packages"
 
-          with open(
-              "arome-capabilities.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(
-                  result,
-                  f,
-                  ensure_ascii=False,
-                  indent=2
-              )
+          PACKAGE=$(jq -r '
+            [
+              .links[]?
+              | select(
+                  ((.title // "") | ascii_downcase | contains("surface"))
+                  or ((.href // "") | endswith("/SP1"))
+                )
+              | (.href // "" | split("/")[-1])
+            ][0] // empty
+          ' arome-packages.json)
 
-          print("Gefundene Coverages:", len(coverages))
+          if [ -z "$PACKAGE" ]; then
+            echo "Kein AROME-Oberflächenpaket automatisch erkannt."
+            jq -r '.links[]? | "- \(.title // "?") -> \(.href // "?")"' arome-packages.json
+            exit 1
+          fi
 
-          for category, values in matches.items():
-              print(category, len(values))
+          echo "Verwendetes Paket: $PACKAGE"
 
-              for value in values[:10]:
-                  print("  ", value)
-          PY
+          HTTP_CODE=$(curl -sS -L \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -o arome-surface-package.json \
+            -w "%{http_code}" \
+            "$BASE/$PACKAGE" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "accept: text/json")
+
+          echo "Surface Package HTTP Status: ${HTTP_CODE}"
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            cat arome-surface-package.json || true
+            exit 1
+          fi
+
+          jq -e . arome-surface-package.json >/dev/null
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
 
       - name: AROME Status erzeugen
         run: |
           python3 <<'PY'
           import json
+          import re
           from datetime import datetime, timezone
 
-          with open(
-              "arome-capabilities.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              capabilities = json.load(f)
+          with open("arome-surface-package.json", "r", encoding="utf-8") as f:
+              surface = json.load(f)
 
-          matches = capabilities.get("matches", {})
+          description = surface.get("description", "")
+          upper = description.upper()
 
-          required = [
-              "temperature",
-              "wind_u",
-              "wind_v",
-              "gust",
-              "precipitation",
-              "cloud",
-              "pressure"
-          ]
-
-          available = {
-              key: bool(matches.get(key))
-              for key in required
+          checks = {
+              "temperature_2m": "T(2M)" in upper or "TEMPERATURE" in upper,
+              "wind_u_10m": "U(10M)" in upper or "U (10M)" in upper,
+              "wind_v_10m": "V(10M)" in upper or "V (10M)" in upper,
+              "gust_10m": "RAF" in upper or "GUST" in upper,
+              "precipitation": "PRECIP" in upper,
+              "cloud": "NEBUL" in upper or "CLOUD" in upper,
+              "pressure_msl": "P(MER)" in upper or "P (MER)" in upper or "MSL" in upper,
           }
+
+          reference_times = []
+          for link in surface.get("links", []):
+              href = link.get("href", "")
+              m = re.search(r"referencetime=([^&]+)", href)
+              if m:
+                  value = m.group(1)
+                  if value not in reference_times:
+                      reference_times.append(value)
 
           status = {
               "status": "ok",
-              "source": "Météo-France",
+              "source": "Météo-France Open Data API",
               "model": "AROME",
-              "resolution_deg": 0.01,
+              "grid": "${{ steps.grid.outputs.grid }}",
+              "api": "DPPaquetAROME v1",
               "generated_at": datetime.now(timezone.utc).isoformat(),
-              "coverage_count": capabilities.get(
-                  "coverage_count",
-                  0
-              ),
-              "parameters_detected": available,
-              "ready_for_data_download": all(
-                  available.values()
-              )
+              "parameters_detected": checks,
+              "ready_for_data_download": all(checks.values()),
+              "reference_times": reference_times[:20],
+              "surface_package_description": description,
           }
 
-          with open(
-              "arome-status.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(
-                  status,
-                  f,
-                  ensure_ascii=False,
-                  indent=2
-              )
+          with open("arome-status.json", "w", encoding="utf-8") as f:
+              json.dump(status, f, ensure_ascii=False, indent=2)
 
-          print(json.dumps(
-              status,
-              ensure_ascii=False,
-              indent=2
-          ))
+          print(json.dumps(status, ensure_ascii=False, indent=2))
           PY
 
       - name: AROME Metadaten zu STRATO übertragen
         env:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
         run: |
+          set -euo pipefail
+
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
             "mkdir -p Orend/paraweather-data"
 
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            arome-capabilities.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-capabilities.json"
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            arome-status.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-status.json"
+          for FILE in \
+            arome-grids.json \
+            arome-packages.json \
+            arome-surface-package.json \
+            arome-status.json
+          do
+            sshpass -e scp \
+              -o StrictHostKeyChecking=no \
+              "$FILE" \
+              "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/$FILE"
+          done
 
       - name: Abschluss
         run: |
           echo "Météo-France Authentifizierung erfolgreich."
-          echo "AROME 0.01 Capabilities ausgewertet."
+          echo "AROME Package API ausgewertet."
+          echo "AROME Metadaten zu STRATO übertragen."
