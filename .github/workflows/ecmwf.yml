@@ -2,12 +2,19 @@ name: ParaWeather ECMWF IFS Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Lauf für einen vollständigen Test erneut verarbeiten"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "20 */6 * * *"
 
 jobs:
   ecmwf:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Werkzeuge installieren
@@ -59,7 +66,11 @@ jobs:
           echo "ECMWF Lauf: $CURRENT_RUN"
           echo "STRATO Lauf: $REMOTE_RUN"
 
-          if [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.force }}" = "true" ]; then
+            echo "Volltest angefordert. Lauf wird erneut verarbeitet."
+            echo "new_data=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
             echo "Kein neuer Modelllauf."
             echo "new_data=false" >> "$GITHUB_OUTPUT"
           else
@@ -391,6 +402,8 @@ jobs:
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
 
         run: |
+          set -euo pipefail
+
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
@@ -404,12 +417,7 @@ jobs:
           sshpass -e scp \
             -o StrictHostKeyChecking=no \
             ecmwf-ifs-index.json \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-index.json"
-
-          sshpass -e scp \
-            -o StrictHostKeyChecking=no \
-            ecmwf-ifs-run.txt \
-            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-run.txt"
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-index.json.new"
 
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
@@ -421,14 +429,27 @@ jobs:
             tar -xzf ecmwf-ifs-tiles.tar.gz \
               -C ecmwf-ifs-tiles-new \
               --strip-components=1 &&
+            test -n "$(find ecmwf-ifs-tiles-new -type f -name "*.json" -print -quit)" &&
             rm -rf ecmwf-ifs-tiles-old &&
             if [ -d ecmwf-ifs-tiles ]; then
               mv ecmwf-ifs-tiles ecmwf-ifs-tiles-old
             fi &&
             mv ecmwf-ifs-tiles-new ecmwf-ifs-tiles &&
+            mv ecmwf-ifs-index.json.new ecmwf-ifs-index.json &&
             rm -rf ecmwf-ifs-tiles-old &&
             rm -f ecmwf-ifs-tiles.tar.gz
             '
+
+          # Der Laufmarker wird absichtlich zuletzt veröffentlicht.
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            ecmwf-ifs-run.txt \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/ecmwf-ifs-run.txt.new"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
+            "mv Orend/paraweather-data/ecmwf-ifs-run.txt.new Orend/paraweather-data/ecmwf-ifs-run.txt"
 
       - name: Kein neuer ECMWF Lauf
         if: steps.changed.outputs.new_data == 'false'
