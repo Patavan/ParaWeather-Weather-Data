@@ -306,10 +306,8 @@ jobs:
           echo "DWD Lauf:    $CURRENT_RUN"
           echo "STRATO Lauf: $REMOTE_RUN"
 
-          if [
-            "${{ inputs.force }}"
-            = "true"
-          ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.force }}" = "true" ]; then
 
             echo "Vollständige Verarbeitung wurde manuell erzwungen."
 
@@ -317,10 +315,7 @@ jobs:
               "new_data=true" \
               >> "$GITHUB_OUTPUT"
 
-          elif [
-            "$CURRENT_RUN"
-            = "$REMOTE_RUN"
-          ]; then
+          elif [ "$CURRENT_RUN" = "$REMOTE_RUN" ]; then
 
             echo "ICON-D2 ist bereits aktuell."
 
