@@ -1226,7 +1226,7 @@ jobs:
                           "cdo",
                           "-s",
                           "outputtab,lat,lon,value",
-                          "remapnn,target_grid_icon_d2_010.txt",
+                          "-remapnn,target_grid_icon_d2_010.txt",
                           "-remap,ICON_D2_002_EASY/target_grid_icon_d2_002.txt,ICON_D2_002_EASY/weights_icon_d2_002.nc",
                           path
                       ],
