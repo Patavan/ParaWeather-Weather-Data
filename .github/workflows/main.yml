@@ -34,7 +34,7 @@ jobs:
             -o ICON_D2_002_EASY.tar.bz2
 
           tar \
-            -xjf ICON_D2_002_EASY.tar.bz2
+            -xf ICON_D2_002_EASY.tar.bz2
 
           cat > target_grid_icon_d2_010.txt <<'EOF'
           gridtype = lonlat
