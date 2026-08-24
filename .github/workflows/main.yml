@@ -20,8 +20,31 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             libeccodes-tools \
+            cdo \
             bzip2 \
             sshpass
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            "https://opendata.dwd.de/weather/lib/cdo/ICON_D2_002_EASY.tar.bz2" \
+            -o ICON_D2_002_EASY.tar.bz2
+
+          tar \
+            -xjf ICON_D2_002_EASY.tar.bz2
+
+          cat > target_grid_icon_d2_010.txt <<'EOF'
+          gridtype = lonlat
+          xsize    = 243
+          ysize    = 149
+          xfirst   = -3.94
+          xinc     = 0.1
+          yfirst   = 43.18
+          yinc     = 0.1
+          EOF
 
       # ============================================================
       # 2. NEUESTEN VOLLSTÄNDIGEN ICON-D2 LAUF FINDEN
@@ -1128,6 +1151,7 @@ jobs:
           import json
           import math
           import os
+          import tempfile
 
           from datetime import (
               datetime,
@@ -1174,16 +1198,43 @@ jobs:
           #
           def read_values(path):
 
-              output = (
-                  subprocess.check_output(
-                      [
-                          "grib_get_data",
-                          path
-                      ],
-                      text=True,
-                      stderr=subprocess.STDOUT
+              # ICON-D2-Modelllevel liegen auf dem nativen, unstrukturierten
+              # Dreiecksgitter. Die GRIB-Datei enthält keine geografischen
+              # Koordinaten pro Punkt; grib_get_data kann sie daher nicht
+              # direkt ausgeben. Mit den offiziellen DWD-Gewichten wird
+              # zuerst auf 0,02 Grad und anschließend auf die von der App
+              # benötigten 0,1 Grad remappt.
+              with tempfile.TemporaryDirectory() as temp_dir:
+
+                  remapped_path = os.path.join(
+                      temp_dir,
+                      "remapped.grib2"
                   )
-              )
+
+                  subprocess.run(
+                      [
+                          "cdo",
+                          "-s",
+                          "-f",
+                          "grb2",
+                          "remapnn,target_grid_icon_d2_010.txt",
+                          "-remap,ICON_D2_002_EASY/target_grid_icon_d2_002.txt,ICON_D2_002_EASY/weights_icon_d2_002.nc",
+                          path,
+                          remapped_path
+                      ],
+                      check=True
+                  )
+
+                  output = (
+                      subprocess.check_output(
+                          [
+                              "grib_get_data",
+                              remapped_path
+                          ],
+                          text=True,
+                          stderr=subprocess.STDOUT
+                      )
+                  )
 
               values = {}
 
