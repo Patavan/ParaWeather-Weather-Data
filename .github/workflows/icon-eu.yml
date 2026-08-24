@@ -720,22 +720,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          sshpass -e ssh \
+          retry_network() {
+            local attempt=1
+            local max_attempts=5
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Netzwerkbefehl nach $attempt Versuchen fehlgeschlagen." >&2
+                return 1
+              fi
+
+              echo "Netzwerkfehler, neuer Versuch $((attempt + 1))/$max_attempts." >&2
+              sleep $((attempt * 10))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          retry_network sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
             "mkdir -p Orend/paraweather-data"
 
-          sshpass -e scp \
+          retry_network sshpass -e scp \
             -o StrictHostKeyChecking=no \
             icon-eu-tiles.tar.gz \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-tiles.tar.gz"
 
-          sshpass -e scp \
+          retry_network sshpass -e scp \
             -o StrictHostKeyChecking=no \
             icon-eu-index.json \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-index.json.new"
 
-          sshpass -e ssh \
+          retry_network sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
             '
@@ -757,12 +773,12 @@ jobs:
             '
 
           # Der Laufmarker wird absichtlich zuletzt veröffentlicht.
-          sshpass -e scp \
+          retry_network sshpass -e scp \
             -o StrictHostKeyChecking=no \
             icon-eu-run.txt \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/icon-eu-run.txt.new"
 
-          sshpass -e ssh \
+          retry_network sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
             "mv Orend/paraweather-data/icon-eu-run.txt.new Orend/paraweather-data/icon-eu-run.txt"
