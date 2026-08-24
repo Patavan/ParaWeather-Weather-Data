@@ -10,271 +10,726 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ============================================================
+      # 1. WERKZEUGE
+      # ============================================================
+
       - name: Werkzeuge installieren
         run: |
+          set -euo pipefail
+
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl jq sshpass
 
-      - name: Météo-France Access Token erzeugen
-        id: token
-        env:
-          METEOFRANCE_BASIC_AUTH: ${{ secrets.METEOFRANCE_BASIC_AUTH }}
+          sudo apt-get install -y -qq \
+            curl \
+            jq \
+            sshpass
+
+
+      # ============================================================
+      # 2. OFFIZIELLEN AROME-DATENSATZ LADEN
+      # ============================================================
+
+      - name: AROME 0.01 Datenkatalog laden
         run: |
           set -euo pipefail
 
-          if [ -z "${METEOFRANCE_BASIC_AUTH:-}" ]; then
-            echo "METEOFRANCE_BASIC_AUTH fehlt."
+          DATASET_URL="https://www.data.gouv.fr/api/1/datasets/paquets-arome-resolution-0-01deg/"
+
+          echo
+          echo "================================"
+          echo "AROME 0.01 Datenkatalog"
+          echo "================================"
+          echo
+
+          HTTP_CODE=$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --output arome-dataset.json \
+              --write-out "%{http_code}" \
+              "$DATASET_URL"
+          )
+
+          echo "HTTP Status: ${HTTP_CODE}"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+
+            echo "AROME Datenkatalog konnte nicht geladen werden."
+
             exit 1
+
           fi
 
-          RESPONSE_FILE="$(mktemp)"
-          HTTP_CODE=$(curl -sS \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            -X POST \
-            "https://portail-api.meteofrance.fr/token" \
-            -d "grant_type=client_credentials" \
-            -H "Authorization: Basic ${METEOFRANCE_BASIC_AUTH}")
+          jq -e . \
+            arome-dataset.json \
+            >/dev/null
 
-          echo "Token HTTP Status: ${HTTP_CODE}"
+          RESOURCE_COUNT=$(
+            jq \
+              '.resources | length' \
+              arome-dataset.json
+          )
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "Météo-France Token konnte nicht erzeugt werden."
-            cat "$RESPONSE_FILE" || true
+          echo
+          echo "AROME Ressourcen:"
+          echo "$RESOURCE_COUNT"
+
+          if [ "$RESOURCE_COUNT" -lt 1 ]; then
+
+            echo "Keine AROME Ressourcen vorhanden."
+
             exit 1
+
           fi
 
-          RESPONSE=$(cat "$RESPONSE_FILE")
 
-          if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-            ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // .token // empty')
-          else
-            ACCESS_TOKEN=$(echo "$RESPONSE" | tr -d '\r\n"')
-          fi
+      # ============================================================
+      # 3. AROME-GRIB-RESSOURCEN AUFLÖSEN
+      # ============================================================
 
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "Kein gültiger Access Token erhalten."
-            exit 1
-          fi
-
-          echo "::add-mask::$ACCESS_TOKEN"
-          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
-          echo "Météo-France Token erfolgreich erzeugt."
-
-      - name: AROME API-Zugang prüfen
-        env:
-          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+      - name: AROME Ressourcen analysieren
         run: |
           set -euo pipefail
 
-          BASE="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1"
+          python3 <<'PY'
 
-          HTTP_CODE=$(curl -sS -L \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            -o arome-grids.json \
-            -w "%{http_code}" \
-            "$BASE/models/AROME/grids" \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "accept: text/json")
+          import json
+          import re
+          import subprocess
+          from collections import defaultdict
 
-          echo "AROME Grids HTTP Status: ${HTTP_CODE}"
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "AROME Package API nicht erreichbar."
-            cat arome-grids.json || true
-            echo
-            echo "Bei HTTP 403 ist DPPaquetAROME im Météo-France-Konto noch nicht freigeschaltet."
-            exit 1
-          fi
+          with open(
+              "arome-dataset.json",
+              "r",
+              encoding="utf-8"
+          ) as file:
 
-          jq -e . arome-grids.json >/dev/null
-          echo "AROME Package API erreichbar."
+              dataset = json.load(
+                  file
+              )
 
-      - name: AROME 0.01 Raster erkennen
-        id: grid
+
+          resources = dataset.get(
+              "resources",
+              []
+          )
+
+
+          print(
+              "Ressourcen insgesamt:",
+              len(resources)
+          )
+
+
+          pattern = re.compile(
+              r"/arome/001/"
+              r"(SP1|SP2|HP1)/"
+              r"arome__001__"
+              r"(SP1|SP2|HP1)__"
+              r"(\d{2})H__"
+              r"([^/]+)\.grib2"
+          )
+
+
+          resolved = []
+
+
+          for number, resource in enumerate(
+              resources,
+              start=1
+          ):
+
+              url = (
+                  resource.get("url")
+                  or
+                  resource.get("latest")
+                  or
+                  ""
+              )
+
+
+              if not url:
+
+                  continue
+
+
+              resource_format = (
+                  resource.get(
+                      "format",
+                      ""
+                  )
+                  or ""
+              ).lower()
+
+
+              if (
+                  resource_format
+                  and
+                  "grib" not in resource_format
+              ):
+
+                  continue
+
+
+              try:
+
+                  result = subprocess.run(
+                      [
+                          "curl",
+                          "--silent",
+                          "--show-error",
+                          "--location",
+                          "--head",
+                          "--retry",
+                          "2",
+                          "--connect-timeout",
+                          "15",
+                          "--max-time",
+                          "30",
+                          "--write-out",
+                          "%{url_effective}",
+                          "--output",
+                          "/dev/null",
+                          url
+                      ],
+                      text=True,
+                      capture_output=True,
+                      check=True
+                  )
+
+                  effective_url = (
+                      result.stdout.strip()
+                  )
+
+              except subprocess.CalledProcessError as error:
+
+                  print(
+                      "HEAD fehlgeschlagen:",
+                      url
+                  )
+
+                  continue
+
+
+              match = pattern.search(
+                  effective_url
+              )
+
+
+              if not match:
+
+                  continue
+
+
+              directory_package = (
+                  match.group(1)
+              )
+
+              filename_package = (
+                  match.group(2)
+              )
+
+              forecast_hour = int(
+                  match.group(3)
+              )
+
+              run = (
+                  match.group(4)
+              )
+
+
+              if (
+                  directory_package
+                  != filename_package
+              ):
+
+                  continue
+
+
+              resolved.append({
+                  "package":
+                      directory_package,
+
+                  "forecast_hour":
+                      forecast_hour,
+
+                  "run":
+                      run,
+
+                  "resource_url":
+                      url,
+
+                  "download_url":
+                      effective_url
+              })
+
+
+              print(
+                  f"{directory_package} "
+                  f"+{forecast_hour:02d}h "
+                  f"{run}"
+              )
+
+
+          if not resolved:
+
+              raise RuntimeError(
+                  "Keine AROME-0.01-GRIB2-Ressourcen erkannt"
+              )
+
+
+          with open(
+              "arome-resources.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+
+              json.dump(
+                  resolved,
+                  file,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+
+          print()
+          print(
+              "Erkannte AROME-GRIB-Ressourcen:",
+              len(resolved)
+          )
+
+          PY
+
+
+      # ============================================================
+      # 4. NEUESTEN GEMEINSAMEN AROME-LAUF BESTIMMEN
+      # ============================================================
+
+      - name: Neuesten vollständigen AROME Lauf bestimmen
+        id: detect
         run: |
           set -euo pipefail
 
-          GRID=$(jq -r '
-            [
-              .links[]?
-              | select(
-                  ((.title // "") | ascii_downcase | contains("0,01"))
-                  or ((.title // "") | ascii_downcase | contains("0.01"))
-                  or ((.href // "") | contains("/0.01"))
-                )
-              | (.href // "" | split("/")[-1])
-            ][0] // empty
-          ' arome-grids.json)
+          python3 <<'PY'
 
-          if [ -z "$GRID" ]; then
-            echo "AROME 0.01 Raster nicht automatisch erkannt."
-            jq -r '.links[]? | "- \(.title // "?") -> \(.href // "?")"' arome-grids.json
-            exit 1
-          fi
+          import json
+          import os
 
-          echo "Erkanntes AROME Raster: $GRID"
-          echo "grid=$GRID" >> "$GITHUB_OUTPUT"
+          from collections import (
+              defaultdict
+          )
 
-      - name: AROME Pakete laden
-        env:
-          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
-        run: |
-          set -euo pipefail
 
-          GRID="${{ steps.grid.outputs.grid }}"
-          URL="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1/models/AROME/grids/${GRID}/packages"
+          with open(
+              "arome-resources.json",
+              "r",
+              encoding="utf-8"
+          ) as file:
 
-          HTTP_CODE=$(curl -sS -L \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            -o arome-packages.json \
-            -w "%{http_code}" \
-            "$URL" \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "accept: text/json")
+              resources = json.load(
+                  file
+              )
 
-          echo "AROME Packages HTTP Status: ${HTTP_CODE}"
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            cat arome-packages.json || true
-            exit 1
-          fi
+          runs = defaultdict(
+              lambda: defaultdict(set)
+          )
 
-          jq -e . arome-packages.json >/dev/null
-          echo "AROME Paketkatalog erfolgreich geladen."
 
-      - name: AROME Oberflächenpaket analysieren
-        id: surface
-        env:
-          ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
-        run: |
-          set -euo pipefail
+          for item in resources:
 
-          GRID="${{ steps.grid.outputs.grid }}"
-          BASE="https://public-api.meteofrance.fr/previnum/DPPaquetAROME/v1/models/AROME/grids/${GRID}/packages"
+              runs[
+                  item["run"]
+              ][
+                  item["package"]
+              ].add(
+                  item["forecast_hour"]
+              )
 
-          PACKAGE=$(jq -r '
-            [
-              .links[]?
-              | select(
-                  ((.title // "") | ascii_downcase | contains("surface"))
-                  or ((.href // "") | endswith("/SP1"))
-                )
-              | (.href // "" | split("/")[-1])
-            ][0] // empty
-          ' arome-packages.json)
 
-          if [ -z "$PACKAGE" ]; then
-            echo "Kein AROME-Oberflächenpaket automatisch erkannt."
-            jq -r '.links[]? | "- \(.title // "?") -> \(.href // "?")"' arome-packages.json
-            exit 1
-          fi
+          required_packages = [
+              "SP1",
+              "SP2",
+              "HP1"
+          ]
 
-          echo "Verwendetes Paket: $PACKAGE"
 
-          HTTP_CODE=$(curl -sS -L \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            -o arome-surface-package.json \
-            -w "%{http_code}" \
-            "$BASE/$PACKAGE" \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "accept: text/json")
+          candidates = []
 
-          echo "Surface Package HTTP Status: ${HTTP_CODE}"
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            cat arome-surface-package.json || true
-            exit 1
-          fi
+          for run, packages in runs.items():
 
-          jq -e . arome-surface-package.json >/dev/null
-          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+              package_counts = {
+                  package:
+                      len(
+                          packages.get(
+                              package,
+                              set()
+                          )
+                      )
+                  for package
+                  in required_packages
+              }
+
+
+              print(
+                  run,
+                  package_counts
+              )
+
+
+              #
+              # Mindestens +00h muss für
+              # alle drei Pakete vorhanden sein.
+              #
+              complete = all(
+                  0 in packages.get(
+                      package,
+                      set()
+                  )
+                  for package
+                  in required_packages
+              )
+
+
+              if complete:
+
+                  candidates.append(
+                      run
+                  )
+
+
+          if not candidates:
+
+              raise RuntimeError(
+                  "Kein gemeinsamer AROME Lauf "
+                  "für SP1, SP2 und HP1 gefunden"
+              )
+
+
+          selected_run = sorted(
+              candidates
+          )[-1]
+
+
+          print()
+          print(
+              "Verwendeter AROME Lauf:",
+              selected_run
+          )
+
+
+          with open(
+              os.environ[
+                  "GITHUB_OUTPUT"
+              ],
+              "a"
+          ) as output:
+
+              output.write(
+                  f"run={selected_run}\n"
+              )
+
+          PY
+
+
+      # ============================================================
+      # 5. AROME STATUS ERZEUGEN
+      # ============================================================
 
       - name: AROME Status erzeugen
         run: |
+          set -euo pipefail
+
           python3 <<'PY'
+
           import json
-          import re
-          from datetime import datetime, timezone
 
-          with open("arome-surface-package.json", "r", encoding="utf-8") as f:
-              surface = json.load(f)
+          from datetime import (
+              datetime,
+              timezone
+          )
 
-          description = surface.get("description", "")
-          upper = description.upper()
 
-          checks = {
-              "temperature_2m": "T(2M)" in upper or "TEMPERATURE" in upper,
-              "wind_u_10m": "U(10M)" in upper or "U (10M)" in upper,
-              "wind_v_10m": "V(10M)" in upper or "V (10M)" in upper,
-              "gust_10m": "RAF" in upper or "GUST" in upper,
-              "precipitation": "PRECIP" in upper,
-              "cloud": "NEBUL" in upper or "CLOUD" in upper,
-              "pressure_msl": "P(MER)" in upper or "P (MER)" in upper or "MSL" in upper,
-          }
+          RUN = (
+              "${{ steps.detect.outputs.run }}"
+          )
 
-          reference_times = []
-          for link in surface.get("links", []):
-              href = link.get("href", "")
-              m = re.search(r"referencetime=([^&]+)", href)
-              if m:
-                  value = m.group(1)
-                  if value not in reference_times:
-                      reference_times.append(value)
+
+          with open(
+              "arome-resources.json",
+              "r",
+              encoding="utf-8"
+          ) as file:
+
+              resources = json.load(
+                  file
+              )
+
+
+          selected = [
+              item
+              for item in resources
+              if item["run"] == RUN
+          ]
+
+
+          packages = {}
+
+
+          for package in [
+              "SP1",
+              "SP2",
+              "HP1"
+          ]:
+
+              hours = sorted({
+                  item[
+                      "forecast_hour"
+                  ]
+                  for item in selected
+                  if item[
+                      "package"
+                  ] == package
+              })
+
+
+              packages[
+                  package
+              ] = {
+                  "available":
+                      bool(hours),
+
+                  "forecast_hours":
+                      hours,
+
+                  "count":
+                      len(hours)
+              }
+
 
           status = {
-              "status": "ok",
-              "source": "Météo-France Open Data API",
-              "model": "AROME",
-              "grid": "${{ steps.grid.outputs.grid }}",
-              "api": "DPPaquetAROME v1",
-              "generated_at": datetime.now(timezone.utc).isoformat(),
-              "parameters_detected": checks,
-              "ready_for_data_download": all(checks.values()),
-              "reference_times": reference_times[:20],
-              "surface_package_description": description,
+
+              "status":
+                  "ok",
+
+              "source":
+                  "Météo-France / data.gouv.fr",
+
+              "model":
+                  "AROME",
+
+              "resolution_deg":
+                  0.01,
+
+              "grid":
+                  "EURW1S100",
+
+              "format":
+                  "GRIB2",
+
+              "model_run":
+                  RUN,
+
+              "generated_at":
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+
+              "authentication_required":
+                  False,
+
+              "packages":
+                  packages,
+
+              "dataset":
+                  "Paquets Arome - Résolution 0,01°",
+
+              "attribution":
+                  "Météo-France",
+
+              "license":
+                  "Licence Ouverte / Open Licence 2.0"
           }
 
-          with open("arome-status.json", "w", encoding="utf-8") as f:
-              json.dump(status, f, ensure_ascii=False, indent=2)
 
-          print(json.dumps(status, ensure_ascii=False, indent=2))
+          with open(
+              "arome-status.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+
+              json.dump(
+                  status,
+                  file,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+
+          print(
+              json.dumps(
+                  status,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+
           PY
+
+
+      # ============================================================
+      # 6. DOWNLOAD-MANIFEST ERZEUGEN
+      # ============================================================
+
+      - name: AROME Download-Manifest erzeugen
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+
+          import json
+
+
+          RUN = (
+              "${{ steps.detect.outputs.run }}"
+          )
+
+
+          with open(
+              "arome-resources.json",
+              "r",
+              encoding="utf-8"
+          ) as file:
+
+              resources = json.load(
+                  file
+              )
+
+
+          selected = [
+              item
+              for item in resources
+              if item["run"] == RUN
+              and
+              item["package"] in (
+                  "SP1",
+                  "SP2",
+                  "HP1"
+              )
+          ]
+
+
+          selected.sort(
+              key=lambda item: (
+                  item["package"],
+                  item["forecast_hour"]
+              )
+          )
+
+
+          manifest = {
+
+              "model":
+                  "AROME",
+
+              "resolution_deg":
+                  0.01,
+
+              "model_run":
+                  RUN,
+
+              "resources":
+                  selected
+          }
+
+
+          with open(
+              "arome-download-manifest.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+
+              json.dump(
+                  manifest,
+                  file,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+
+          print(
+              "Manifest-Ressourcen:",
+              len(selected)
+          )
+
+          PY
+
+
+      # ============================================================
+      # 7. ZU STRATO ÜBERTRAGEN
+      # ============================================================
 
       - name: AROME Metadaten zu STRATO übertragen
         env:
+
           SSHPASS: ${{ secrets.STRATO_PASSWORD }}
+
         run: |
           set -euo pipefail
+
+          echo
+          echo "================================"
+          echo "AROME Upload zu STRATO"
+          echo "================================"
+          echo
+
 
           sshpass -e ssh \
             -o StrictHostKeyChecking=no \
             "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}" \
             "mkdir -p Orend/paraweather-data"
 
-          for FILE in \
-            arome-grids.json \
-            arome-packages.json \
-            arome-surface-package.json \
-            arome-status.json
-          do
-            sshpass -e scp \
-              -o StrictHostKeyChecking=no \
-              "$FILE" \
-              "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/$FILE"
-          done
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            arome-status.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-status.json"
+
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
+            arome-download-manifest.json \
+            "${{ secrets.STRATO_USER }}@${{ secrets.STRATO_HOST }}:Orend/paraweather-data/arome-download-manifest.json"
+
+
+          echo
+          echo "AROME Metadaten erfolgreich übertragen."
+
+
+      # ============================================================
+      # 8. ABSCHLUSS
+      # ============================================================
 
       - name: Abschluss
         run: |
-          echo "Météo-France Authentifizierung erfolgreich."
-          echo "AROME Package API ausgewertet."
-          echo "AROME Metadaten zu STRATO übertragen."
+          echo
+          echo "================================"
+          echo "AROME erfolgreich"
+          echo "================================"
+          echo
+          echo "AROME 0.01 Datenquelle: OK"
+          echo "SP1 erkannt"
+          echo "SP2 erkannt"
+          echo "HP1 erkannt"
+          echo "Kein Météo-France API-Token erforderlich"
+          echo "Kein DPPaquetAROME"
+          echo "Kein WCS GetCapabilities"
+          echo
