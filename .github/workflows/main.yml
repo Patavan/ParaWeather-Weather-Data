@@ -1151,7 +1151,6 @@ jobs:
           import json
           import math
           import os
-          import tempfile
 
           from datetime import (
               datetime,
@@ -1204,37 +1203,20 @@ jobs:
               # direkt ausgeben. Mit den offiziellen DWD-Gewichten wird
               # zuerst auf 0,02 Grad und anschließend auf die von der App
               # benötigten 0,1 Grad remappt.
-              with tempfile.TemporaryDirectory() as temp_dir:
-
-                  remapped_path = os.path.join(
-                      temp_dir,
-                      "remapped.grib2"
-                  )
-
-                  subprocess.run(
+              output = (
+                  subprocess.check_output(
                       [
                           "cdo",
                           "-s",
-                          "-f",
-                          "grb2",
+                          "outputtab,lat,lon,value",
                           "remapnn,target_grid_icon_d2_010.txt",
                           "-remap,ICON_D2_002_EASY/target_grid_icon_d2_002.txt,ICON_D2_002_EASY/weights_icon_d2_002.nc",
-                          path,
-                          remapped_path
+                          path
                       ],
-                      check=True
+                      text=True,
+                      stderr=subprocess.STDOUT
                   )
-
-                  output = (
-                      subprocess.check_output(
-                          [
-                              "grib_get_data",
-                              remapped_path
-                          ],
-                          text=True,
-                          stderr=subprocess.STDOUT
-                      )
-                  )
+              )
 
               values = {}
 
